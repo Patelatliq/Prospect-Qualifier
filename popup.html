@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LeadQualify — AI Prospect Scorer</title>
+  <link rel="stylesheet" href="popup.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="app" id="app">
+
+    <!-- ═══════════════ HEADER ═══════════════ -->
+    <header class="header">
+      <div class="header__logo">
+        <svg class="header__icon" viewBox="0 0 24 24" fill="none">
+          <circle cx="12" cy="12" r="10" stroke="url(#grad)" stroke-width="2"/>
+          <circle cx="12" cy="12" r="6"  stroke="url(#grad)" stroke-width="1.5"/>
+          <circle cx="12" cy="12" r="2"  fill="url(#grad)"/>
+          <defs><linearGradient id="grad" x1="0" y1="0" x2="24" y2="24">
+            <stop offset="0%" stop-color="#6c5ce7"/>
+            <stop offset="100%" stop-color="#a29bfe"/>
+          </linearGradient></defs>
+        </svg>
+        <h1 class="header__title">LeadQualify</h1>
+      </div>
+      <span class="header__version">v2</span>
+    </header>
+
+    <!-- ═══════════════ API KEY ═══════════════ -->
+    <section class="card api-section" id="apiSection">
+      <button class="api-toggle" id="apiToggle" type="button">
+        <span class="api-toggle__label" id="apiToggleLabel">🔑 Set API Key</span>
+        <svg class="api-toggle__chevron" id="apiChevron" viewBox="0 0 16 16" width="14" height="14">
+          <path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/>
+        </svg>
+      </button>
+      <div class="api-body" id="apiBody">
+        <div class="input-group">
+          <input type="password" class="input" id="apiKeyInput"
+                 placeholder="gsk_xxxxxxxxxxxxxxxx" spellcheck="false" autocomplete="off">
+          <button class="btn btn--sm btn--accent" id="saveApiKey" type="button">Save</button>
+        </div>
+        <p class="hint">Free key from <a href="https://console.groq.com" target="_blank" rel="noopener">console.groq.com</a></p>
+      </div>
+    </section>
+
+    <!-- ═══════════════ ICP PROFILE SELECTOR ═══════════════ -->
+    <section class="card icp-section" id="icpSection">
+      <button class="api-toggle" id="icpToggle" type="button">
+        <span class="api-toggle__label">🎯 ICP Profile</span>
+        <svg class="api-toggle__chevron" id="icpChevron" viewBox="0 0 16 16" width="14" height="14">
+          <path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/>
+        </svg>
+      </button>
+
+      <!-- Active ICP badge (always visible) -->
+      <div class="icp-active-badge" id="icpActiveBadge">
+        <span class="icp-active-badge__name" id="icpActiveName">🌐 Global Default</span>
+        <span class="icp-active-badge__reason" id="icpActiveReason"></span>
+      </div>
+
+      <div class="icp-body" id="icpBody">
+        <!-- Auto-switch toggle -->
+        <div class="icp-row">
+          <label class="icp-switch-label">
+            <input type="checkbox" id="icpAutoSwitch" checked>
+            <span class="icp-switch-slider"></span>
+            <span class="icp-switch-text">Auto-switch by region</span>
+          </label>
+        </div>
+
+        <!-- Profile selector -->
+        <div class="icp-row">
+          <label class="icp-label">Active Profile</label>
+          <select class="icp-select" id="icpProfileSelect"></select>
+        </div>
+
+        <!-- Profile name -->
+        <div class="icp-row">
+          <label class="icp-label">Profile Name</label>
+          <input class="input icp-input" id="icpName" placeholder="e.g. 🇺🇸 US Enterprise">
+        </div>
+
+        <!-- Regions -->
+        <div class="icp-row">
+          <label class="icp-label">Region Keywords <span class="icp-hint">(comma-separated)</span></label>
+          <input class="input icp-input" id="icpRegions" placeholder="e.g. United States, USA, California">
+        </div>
+
+        <!-- Revenue threshold -->
+        <div class="icp-row">
+          <label class="icp-label">Revenue Threshold</label>
+          <select class="icp-select" id="icpRevenueThreshold">
+            <option value="250000">$250K</option>
+            <option value="500000">$500K</option>
+            <option value="1000000">$1M</option>
+            <option value="2500000" selected>$2.5M</option>
+            <option value="5000000">$5M</option>
+            <option value="10000000">$10M</option>
+            <option value="25000000">$25M</option>
+            <option value="50000000">$50M</option>
+          </select>
+        </div>
+
+        <!-- Weight sliders -->
+        <div class="icp-weights">
+          <label class="icp-label">Scoring Weights <span class="icp-weight-total" id="icpWeightTotal">100%</span></label>
+
+          <div class="icp-weight-row">
+            <span class="icp-weight-name">Title Fit</span>
+            <input type="range" class="icp-slider" id="wTitleFit" min="0" max="50" value="20">
+            <span class="icp-weight-val" id="wTitleFitVal">20%</span>
+          </div>
+          <div class="icp-weight-row">
+            <span class="icp-weight-name">Company Size</span>
+            <input type="range" class="icp-slider" id="wCompanySize" min="0" max="50" value="15">
+            <span class="icp-weight-val" id="wCompanySizeVal">15%</span>
+          </div>
+          <div class="icp-weight-row">
+            <span class="icp-weight-name">Industry</span>
+            <input type="range" class="icp-slider" id="wIndustry" min="0" max="50" value="15">
+            <span class="icp-weight-val" id="wIndustryVal">15%</span>
+          </div>
+          <div class="icp-weight-row">
+            <span class="icp-weight-name">Tech Signals</span>
+            <input type="range" class="icp-slider" id="wTechSignals" min="0" max="50" value="15">
+            <span class="icp-weight-val" id="wTechSignalsVal">15%</span>
+          </div>
+          <div class="icp-weight-row">
+            <span class="icp-weight-name">AI Fit</span>
+            <input type="range" class="icp-slider" id="wAiFit" min="0" max="50" value="10">
+            <span class="icp-weight-val" id="wAiFitVal">10%</span>
+          </div>
+          <div class="icp-weight-row">
+            <span class="icp-weight-name">Revenue</span>
+            <input type="range" class="icp-slider" id="wCompanyRevenue" min="0" max="50" value="25">
+            <span class="icp-weight-val" id="wCompanyRevenueVal">25%</span>
+          </div>
+        </div>
+
+        <!-- Target Titles -->
+        <div class="icp-row">
+          <label class="icp-label">Target Titles <span class="icp-hint">(comma-separated)</span></label>
+          <input class="input icp-input" id="icpTargetTitles" placeholder="CEO, CTO, VP, Founder">
+        </div>
+
+        <!-- Target Industries (multi-select dropdown) -->
+        <div class="icp-row">
+          <label class="icp-label">Target Industries <span class="icp-hint">(click to select)</span></label>
+          <div class="ind-select" id="indSelectTarget">
+            <div class="ind-select__pills" id="indPillsTarget">
+              <input class="ind-select__search" id="indSearchTarget" type="text" placeholder="Search industries...">
+            </div>
+            <div class="ind-select__dropdown" id="indDropdownTarget">
+              <div class="ind-select__list" id="indListTarget"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Excluded Industries (multi-select dropdown) -->
+        <div class="icp-row">
+          <label class="icp-label">Excluded Industries <span class="icp-hint">(click to select)</span></label>
+          <div class="ind-select" id="indSelectExcluded">
+            <div class="ind-select__pills" id="indPillsExcluded">
+              <input class="ind-select__search" id="indSearchExcluded" type="text" placeholder="Search industries...">
+            </div>
+            <div class="ind-select__dropdown" id="indDropdownExcluded">
+              <div class="ind-select__list" id="indListExcluded"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Profile action buttons -->
+        <div class="icp-actions">
+          <button class="btn btn--sm btn--accent" id="icpSave" type="button">💾 Save Profile</button>
+          <button class="btn btn--sm btn--ghost-sm" id="icpNew" type="button">➕ New</button>
+          <button class="btn btn--sm btn--ghost-sm btn--danger-text" id="icpDelete" type="button">🗑️ Delete</button>
+        </div>
+
+        <button class="btn btn--ghost icp-reset-btn" id="icpResetDefaults" type="button">
+          <span class="btn__icon">↩️</span> Reset All to Defaults
+        </button>
+      </div>
+    </section>
+
+    <!-- ═══════════════ STATE: NOT ON LINKEDIN ═══════════════ -->
+    <section class="card state-card" id="stateNotLinkedin" hidden>
+      <div class="empty-state">
+        <div class="empty-state__icon">🔗</div>
+        <p class="empty-state__title">Navigate to LinkedIn</p>
+        <p class="empty-state__desc">Open a LinkedIn profile or company page, then click this extension.</p>
+      </div>
+    </section>
+
+    <!-- ═══════════════ STATE: PROSPECT DATA ═══════════════ -->
+    <section class="card state-card" id="stateProspect" hidden>
+      <div class="prospect-info">
+        <div class="prospect-info__avatar" id="prospectAvatar">?</div>
+        <div class="prospect-info__details">
+          <h2 class="prospect-info__name" id="prospectName">—</h2>
+          <p class="prospect-info__headline" id="prospectHeadline">—</p>
+          <p class="prospect-info__meta" id="prospectMeta"></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════ STATE: LOADING ═══════════════ -->
+    <section class="card state-card" id="stateLoading" hidden>
+      <div class="loading">
+        <div class="loading__spinner">
+          <div class="loading__ring"></div>
+          <div class="loading__ring loading__ring--delay"></div>
+        </div>
+        <p class="loading__text" id="loadingText">Scoring with Llama 4 Scout ⚡</p>
+        <p class="loading__sub">Cascading through models…</p>
+      </div>
+    </section>
+
+    <!-- ═══════════════ STATE: RESULT ═══════════════ -->
+    <section class="card state-card" id="stateResult" hidden>
+
+      <!-- Cache badge -->
+      <div class="cache-badge" id="cacheBadge" hidden>
+        <span class="cache-badge__icon">📌</span>
+        <span class="cache-badge__text" id="cacheBadgeText">Cached</span>
+      </div>
+
+      <!-- ICP Profile used badge -->
+      <div class="icp-used-badge" id="icpUsedBadge" hidden>
+        <span class="icp-used-badge__icon">🎯</span>
+        <span class="icp-used-badge__text" id="icpUsedText">Scored with: 🌐 Global Default</span>
+      </div>
+
+      <!-- Data Confidence Badge -->
+      <div class="data-confidence" id="dataConfidence" hidden>
+        <div class="data-confidence__header">
+          <div class="data-confidence__score-wrap">
+            <span class="data-confidence__icon">🔍</span>
+            <span class="data-confidence__label">Data Confidence:</span>
+            <span class="data-confidence__value" id="dataConfidenceValue">0%</span>
+            <span class="data-confidence__status" id="dataConfidenceStatus">—</span>
+          </div>
+          <button class="data-confidence__toggle" id="dataConfidenceToggle" type="button">
+            <svg viewBox="0 0 16 16" width="12" height="12">
+              <path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+        <div class="data-confidence__bar">
+          <div class="data-confidence__fill" id="dataConfidenceFill"></div>
+        </div>
+        <div class="data-confidence__grid" id="dataConfidenceGrid">
+          <div class="dc-field" id="dcRevenue">
+            <span class="dc-field__icon">❌</span>
+            <span class="dc-field__name">Revenue</span>
+            <span class="dc-field__weight">25%</span>
+          </div>
+          <div class="dc-field" id="dcCompanySize">
+            <span class="dc-field__icon">❌</span>
+            <span class="dc-field__name">Company Size</span>
+            <span class="dc-field__weight">15%</span>
+          </div>
+          <div class="dc-field" id="dcIndustry">
+            <span class="dc-field__icon">❌</span>
+            <span class="dc-field__name">Industry</span>
+            <span class="dc-field__weight">15%</span>
+          </div>
+          <div class="dc-field" id="dcTitle">
+            <span class="dc-field__icon">❌</span>
+            <span class="dc-field__name">Title</span>
+            <span class="dc-field__weight">15%</span>
+          </div>
+          <div class="dc-field" id="dcExperience">
+            <span class="dc-field__icon">❌</span>
+            <span class="dc-field__name">Experience</span>
+            <span class="dc-field__weight">10%</span>
+          </div>
+          <div class="dc-field" id="dcLocation">
+            <span class="dc-field__icon">❌</span>
+            <span class="dc-field__name">Location</span>
+            <span class="dc-field__weight">5%</span>
+          </div>
+          <div class="dc-field" id="dcSkills">
+            <span class="dc-field__icon">❌</span>
+            <span class="dc-field__name">Skills</span>
+            <span class="dc-field__weight">5%</span>
+          </div>
+          <div class="dc-field" id="dcAbout">
+            <span class="dc-field__icon">❌</span>
+            <span class="dc-field__name">About</span>
+            <span class="dc-field__weight">5%</span>
+          </div>
+          <div class="dc-field" id="dcEducation">
+            <span class="dc-field__icon">❌</span>
+            <span class="dc-field__name">Education</span>
+            <span class="dc-field__weight">5%</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Score ring -->
+      <div class="score-display">
+        <div class="score-ring-wrap">
+          <svg class="score-ring" viewBox="0 0 128 128">
+            <circle class="score-ring__track" cx="64" cy="64" r="54"/>
+            <circle class="score-ring__fill"  cx="64" cy="64" r="54" id="scoreRingFill"/>
+          </svg>
+          <div class="score-ring__value">
+            <span class="score-ring__number" id="scoreNumber">0</span>
+            <span class="score-ring__label" id="scoreTier">—</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Decision Maker Badge -->
+      <div class="decision-maker" id="decisionMaker" hidden>
+        <div class="decision-maker__header">
+          <span class="decision-maker__icon" id="dmIcon">👤</span>
+          <div class="decision-maker__info">
+            <span class="decision-maker__level" id="dmLevel">—</span>
+            <span class="decision-maker__title" id="dmTitle">—</span>
+          </div>
+        </div>
+        <div class="decision-maker__badges">
+          <span class="dm-badge dm-badge--founder" id="dmFounder" hidden>👑 Founder</span>
+          <span class="dm-badge dm-badge--budget" id="dmBudget" hidden>💰 Budget Authority</span>
+        </div>
+      </div>
+
+      <!-- Breakdown -->
+      <div class="breakdown" id="breakdown">
+        <div class="breakdown__row" data-cat="titleFit">
+          <span class="breakdown__label">Title Fit</span>
+          <div class="breakdown__bar"><div class="breakdown__fill" id="barTitleFit"></div></div>
+          <span class="breakdown__score" id="scoreTitleFit">0</span>
+        </div>
+        <div class="breakdown__row" data-cat="companySize">
+          <span class="breakdown__label">Company Size</span>
+          <div class="breakdown__bar"><div class="breakdown__fill" id="barCompanySize"></div></div>
+          <span class="breakdown__score" id="scoreCompanySize">0</span>
+        </div>
+        <div class="breakdown__row" data-cat="industry">
+          <span class="breakdown__label">Industry</span>
+          <div class="breakdown__bar"><div class="breakdown__fill" id="barIndustry"></div></div>
+          <span class="breakdown__score" id="scoreIndustry">0</span>
+        </div>
+        <div class="breakdown__row" data-cat="techSignals">
+          <span class="breakdown__label">Tech Signals</span>
+          <div class="breakdown__bar"><div class="breakdown__fill" id="barTechSignals"></div></div>
+          <span class="breakdown__score" id="scoreTechSignals">0</span>
+        </div>
+        <div class="breakdown__row" data-cat="aiFit">
+          <span class="breakdown__label">AI Fit</span>
+          <div class="breakdown__bar"><div class="breakdown__fill" id="barAiFit"></div></div>
+          <span class="breakdown__score" id="scoreAiFit">0</span>
+        </div>
+        <div class="breakdown__row" data-cat="companyRevenue">
+          <span class="breakdown__label">Revenue</span>
+          <div class="breakdown__bar"><div class="breakdown__fill" id="barCompanyRevenue"></div></div>
+          <span class="breakdown__score" id="scoreCompanyRevenue">0</span>
+        </div>
+      </div>
+
+      <!-- AI Summary -->
+      <div class="summary-card" id="summaryCard">
+        <p class="summary-card__text" id="summaryText"></p>
+        <p class="summary-card__approach" id="approachText"></p>
+      </div>
+
+      <!-- Experience Summary -->
+      <div class="exp-summary" id="expSummary" hidden>
+        <h3 class="section-title">📋 Experience Overview</h3>
+        <div class="exp-summary__grid">
+          <div class="exp-stat">
+            <span class="exp-stat__value" id="expYears">—</span>
+            <span class="exp-stat__label">Years Exp.</span>
+          </div>
+          <div class="exp-stat">
+            <span class="exp-stat__value" id="expCurrentRole">—</span>
+            <span class="exp-stat__label">Current Role</span>
+          </div>
+        </div>
+        <div class="exp-detail" id="expCurrentCompany"></div>
+        <div class="exp-detail" id="expPreviousRoles"></div>
+        <div class="exp-detail" id="expIndustries"></div>
+      </div>
+
+      <!-- Key Insights -->
+      <div class="insights-section" id="insightsSection" hidden>
+        <h3 class="section-title">💡 Key Insights</h3>
+        <ul class="insights-list" id="insightsList"></ul>
+      </div>
+
+      <!-- Talking Points -->
+      <div class="talking-points" id="talkingPoints" hidden>
+        <h3 class="section-title">🎯 Talking Points</h3>
+        <ul class="talking-list" id="talkingList"></ul>
+      </div>
+
+      <!-- Red Flags -->
+      <div class="red-flags" id="redFlags" hidden>
+        <h3 class="section-title">⚠️ Red Flags</h3>
+        <ul class="red-flags-list" id="redFlagsList"></ul>
+      </div>
+
+      <!-- Model used -->
+      <div class="model-badge" id="modelBadge">
+        <span class="model-badge__label">Model:</span>
+        <span class="model-badge__value" id="modelUsedName">—</span>
+      </div>
+
+    </section>
+
+    <!-- ═══════════════ STATE: LIST VIEW ═══════════════ -->
+    <section class="card state-card" id="stateListView" hidden>
+      <div class="list-header">
+        <div class="list-header__info">
+          <span class="list-header__icon">📋</span>
+          <span class="list-header__count" id="listCount">0 leads found</span>
+        </div>
+      </div>
+
+      <!-- Batch progress -->
+      <div class="batch-progress" id="batchProgress" hidden>
+        <div class="batch-progress__bar">
+          <div class="batch-progress__fill" id="batchProgressFill"></div>
+        </div>
+        <span class="batch-progress__text" id="batchProgressText">0 / 0</span>
+      </div>
+
+      <!-- Lead list -->
+      <div class="lead-list" id="leadList"></div>
+
+      <!-- List actions -->
+      <div class="list-actions">
+        <button class="btn btn--primary" id="btnScoreAll" type="button">
+          <span class="btn__icon">⚡</span> Score All
+        </button>
+        <button class="btn btn--stop" id="btnStopBatch" type="button" hidden>
+          <span class="btn__icon">⏹️</span> Stop
+        </button>
+      </div>
+    </section>
+
+    <!-- ═══════════════ STATE: ERROR ═══════════════ -->
+    <section class="card state-card" id="stateError" hidden>
+      <div class="error-state">
+        <div class="error-state__icon">⚠️</div>
+        <p class="error-state__msg" id="errorMessage">Something went wrong.</p>
+      </div>
+    </section>
+
+    <!-- ═══════════════ CASCADE HEALTH ═══════════════ -->
+    <section class="cascade-bar" id="cascadeBar">
+      <span class="cascade-bar__label">Cascade</span>
+      <div class="cascade-bar__dots">
+        <span class="cascade-dot cascade-dot--ok" id="dot0" title="Llama 4 Scout">⚡</span>
+        <span class="cascade-dot cascade-dot--ok" id="dot1" title="Llama 3.3 70B">🧠</span>
+        <span class="cascade-dot cascade-dot--ok" id="dot2" title="Qwen 3 32B">🔮</span>
+      </div>
+      <span class="cascade-bar__count" id="cascadeCount">3/3 healthy</span>
+    </section>
+
+    <!-- ═══════════════ ACTIONS ═══════════════ -->
+    <section class="actions">
+      <button class="btn btn--primary" id="btnScore" type="button">
+        <span class="btn__icon">🎯</span> Score Prospect
+      </button>
+      <button class="btn btn--ghost" id="btnReset" type="button">
+        <span class="btn__icon">🔄</span> Reset Rate Limit Cache
+      </button>
+    </section>
+
+    <!-- ═══════════════ TOAST ═══════════════ -->
+    <div class="toast" id="toast" hidden>
+      <p class="toast__msg" id="toastMsg"></p>
+    </div>
+
+  </div>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

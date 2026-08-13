@@ -16,6 +16,7 @@ const KEYS = {
   ICP_PROFILES:    'icp_profiles',
   ACTIVE_ICP_ID:   'active_icp_id',
   ICP_AUTO_SWITCH: 'icp_auto_switch',
+  TERMS_ACCEPTED:  'terms_accepted',
 };
 
 /** Return today's date string in UTC (YYYY-MM-DD) */
@@ -41,6 +42,21 @@ export async function removeApiKey() {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Acceptable-use acknowledgement                                    */
+/* ------------------------------------------------------------------ */
+
+/** Whether the user has acknowledged the acceptable-use / data notice. */
+export async function getTermsAccepted() {
+  const result = await chrome.storage.local.get(KEYS.TERMS_ACCEPTED);
+  return result[KEYS.TERMS_ACCEPTED] === true;
+}
+
+/** Record the user's acknowledgement of the acceptable-use / data notice. */
+export async function setTermsAccepted(accepted) {
+  await chrome.storage.local.set({ [KEYS.TERMS_ACCEPTED]: !!accepted });
+}
+
+/* ------------------------------------------------------------------ */
 /*  Rate-limit flags                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -54,16 +70,26 @@ async function _setLimits(limits) {
 }
 
 /**
- * Mark a model as exhausted for today.
- * @param {string} modelId   e.g. "meta-llama/llama-4-scout-17b-16e-instruct"
- * @param {string} reason    "RPD" | "RPM" | "TPM"
+ * Mark a model as exhausted.
+ * - RPD/TPD (daily) limits expire at midnight UTC.
+ * - RPM/TPM (per-minute) limits expire after 60 seconds.
+ *
+ * @param {string} modelId   e.g. "llama-3.3-70b-versatile"
+ * @param {string} reason    "RPD" | "RPM" | "TPM" | "TPD"
  */
-export async function setModelExhausted(modelId, reason = 'RPD') {
+export async function setModelExhausted(modelId, reason = 'RPM') {
   const limits = await _getLimits();
+
+  // Per-minute limits → short cooldown (60s)
+  // Per-day limits    → expire at midnight UTC
+  const isDaily = reason === 'RPD' || reason === 'TPD';
+  const ttlMs   = isDaily ? null : 60 * 1000;  // 60 seconds for RPM/TPM
+
   limits[modelId] = {
     exhausted:     true,
     exhaustedAt:   Date.now(),
     exhaustedDate: utcToday(),
+    expiresAt:     ttlMs ? Date.now() + ttlMs : null,  // null = midnight
     reason,
   };
   await _setLimits(limits);
@@ -71,15 +97,22 @@ export async function setModelExhausted(modelId, reason = 'RPD') {
 
 /**
  * Check whether a model is currently marked as exhausted.
- * Automatically clears stale flags from previous UTC days.
+ * Auto-clears expired flags (previous day OR TTL expired).
  */
 export async function isModelExhausted(modelId) {
   const limits = await _getLimits();
   const entry  = limits[modelId];
   if (!entry?.exhausted) return false;
 
-  // Auto-reset if the flag is from a previous day
-  if (entry.exhaustedDate !== utcToday()) {
+  // Auto-reset if TTL expired (RPM/TPM limits)
+  if (entry.expiresAt && Date.now() > entry.expiresAt) {
+    delete limits[modelId];
+    await _setLimits(limits);
+    return false;
+  }
+
+  // Auto-reset if the flag is from a previous day (RPD/TPD limits)
+  if (!entry.expiresAt && entry.exhaustedDate !== utcToday()) {
     delete limits[modelId];
     await _setLimits(limits);
     return false;
@@ -106,13 +139,19 @@ export async function getCascadeHealth() {
   let   dirty  = false;
 
   for (const [id, entry] of Object.entries(limits)) {
-    if (entry.exhausted && entry.exhaustedDate === today) {
-      health[id] = { exhausted: true, reason: entry.reason };
-    } else if (entry.exhausted) {
-      // Stale — clean up
+    if (!entry.exhausted) continue;
+
+    // Mirror isModelExhausted() so the health display and the skip decision
+    // agree: prune TTL-expired (RPM/TPM) and previous-day (RPD/TPD) entries.
+    const ttlExpired = entry.expiresAt && Date.now() > entry.expiresAt;
+    const dayExpired = !entry.expiresAt && entry.exhaustedDate !== today;
+    if (ttlExpired || dayExpired) {
       delete limits[id];
       dirty = true;
+      continue;
     }
+
+    health[id] = { exhausted: true, reason: entry.reason };
   }
 
   if (dirty) await _setLimits(limits);
@@ -147,7 +186,10 @@ async function _setCache(cache) {
  * Scoring version — bump this whenever the scoring prompt or logic changes.
  * Old cached scores with a different version are automatically invalidated.
  */
-const SCORING_VERSION = 4;
+const SCORING_VERSION = 9;   // v9: confidence-weighted overall score (low-data-aware)
+
+/** Cap on cached scores; oldest are evicted (LRU by timestamp) beyond this. */
+const MAX_CACHED_SCORES = 500;
 
 /**
  * Cache a score result for a URL.
@@ -162,6 +204,18 @@ export async function cacheScore(url, result) {
     timestamp: Date.now(),
     version: SCORING_VERSION,
   };
+
+  // Evict oldest entries beyond the cap (LRU by timestamp) so the cache can't
+  // grow unbounded toward the chrome.storage.local quota.
+  const keys = Object.keys(cache);
+  if (keys.length > MAX_CACHED_SCORES) {
+    keys
+      .map(k => [k, cache[k]?.timestamp || 0])
+      .sort((a, b) => a[1] - b[1])
+      .slice(0, keys.length - MAX_CACHED_SCORES)
+      .forEach(([k]) => delete cache[k]);
+  }
+
   await _setCache(cache);
 }
 

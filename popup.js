@@ -126,6 +126,8 @@ import {
   getIcpAutoSwitch,
   setIcpAutoSwitch,
   resolveIcpProfile,
+  getTermsAccepted,
+  setTermsAccepted,
 } from './storage-manager.js';
 
 /* ================================================================= */
@@ -134,7 +136,7 @@ import {
 
 const CIRCUMFERENCE = 2 * Math.PI * 54;   // score-ring radius = 54
 const TIER_EMOJI    = { HOT: '🔥', WARM: '🌡️', COLD: '❄️' };
-const BATCH_DELAY   = 3000; // 3 seconds between batch scores
+const BATCH_DELAY   = 3000; // 3 seconds between batch scores (safe with reduced token usage)
 
 /* ================================================================= */
 /*  DOM refs (cached once)                                           */
@@ -217,6 +219,17 @@ const el = {
   // Cache badge
   cacheBadge:     $('cacheBadge'),
   cacheBadgeText: $('cacheBadgeText'),
+
+  // Qualifiable % (score confidence)
+  qualifiable:       $('qualifiable'),
+  qualifiableValue:  $('qualifiableValue'),
+  qualifiableStatus: $('qualifiableStatus'),
+  qualifiableFill:   $('qualifiableFill'),
+  qualifiableNote:   $('qualifiableNote'),
+
+  // Acceptable-use gate
+  consentGate:   $('consentGate'),
+  consentAccept: $('consentAccept'),
 
   // Data Confidence
   dataConfidence:       $('dataConfidence'),
@@ -313,6 +326,7 @@ let hasApiKey         = false;
 let currentListData   = null;
 let batchStopped      = false;
 let isBatchRunning    = false;
+let isScoring         = false;   // a single-profile score is in flight
 let cachedResult      = null;
 let currentIcpProfile = null;   // resolved ICP for current prospect
 let icpProfiles       = [];     // all profiles from storage
@@ -323,13 +337,32 @@ let editingProfileId  = null;   // which profile is being edited in settings
 /* ================================================================= */
 
 document.addEventListener('DOMContentLoaded', async () => {
+  await checkConsent();
   await initializeIcpProfiles();
   await loadIcpSettings();
   bindEvents();
   await checkApiKey();
   await checkCurrentPage();
   await refreshCascadeHealth();
+  watchTabNavigation();
 });
+
+/**
+ * First-run acceptable-use gate. Shows the consent overlay until the user
+ * acknowledges it, then records the acknowledgement so it isn't shown again.
+ */
+async function checkConsent() {
+  const accepted = await getTermsAccepted();
+  if (accepted) {
+    el.consentGate.hidden = true;
+    return;
+  }
+  el.consentGate.hidden = false;
+  el.consentAccept.addEventListener('click', async () => {
+    await setTermsAccepted(true);
+    el.consentGate.hidden = true;
+  }, { once: true });
+}
 
 /* ================================================================= */
 /*  Event bindings                                                   */
@@ -518,6 +551,45 @@ async function checkCurrentPage() {
 }
 
 /* ================================================================= */
+/*  SPA-navigation refresh                                           */
+/* ================================================================= */
+
+/**
+ * LinkedIn is a single-page app: navigating between profiles doesn't reload
+ * the tab, so the side panel would otherwise keep showing the previous
+ * prospect. Watch the active tab for URL changes (and tab switches) and
+ * re-scan — debounced, and skipped while a score/batch is running so we don't
+ * yank the view mid-scoring.
+ */
+let _rescanTimer = null;
+
+function scheduleRescan() {
+  clearTimeout(_rescanTimer);
+  _rescanTimer = setTimeout(async () => {
+    // If a score/batch is in flight, don't scan now — but DON'T drop the
+    // navigation either; re-arm so it's honored once the flag clears (bounded,
+    // self-clearing poll, since isScoring/isBatchRunning always reset).
+    if (isBatchRunning || isScoring) {
+      scheduleRescan();
+      return;
+    }
+    await checkCurrentPage();   // idempotent: re-reads the active tab
+    await refreshCascadeHealth();
+  }, 600);
+}
+
+function watchTabNavigation() {
+  // URL changes in the active tab (includes LinkedIn's history-API navigations,
+  // since we hold host permission for linkedin.com). No URL-equality dedupe —
+  // the 600ms debounce collapses event storms and checkCurrentPage is idempotent.
+  chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+    if (tab?.active && changeInfo.url) scheduleRescan();
+  });
+  // Switching to another tab (e.g. a different LinkedIn profile in another tab).
+  chrome.tabs.onActivated.addListener(() => scheduleRescan());
+}
+
+/* ================================================================= */
 /*  Render prospect preview                                          */
 /* ================================================================= */
 
@@ -556,6 +628,24 @@ async function handleScore() {
   if (!currentProspect) return;
   if (!hasApiKey) return toast('Set your API key first', true);
 
+  // ---- Scrape-quality gate ----
+  // Don't score a page that hasn't loaded / has no identity, and warn (but
+  // allow) when page data is very thin — confidence-weighting handles the rest.
+  // Meaningful page text counts as identity: it's the scraper's deliberate
+  // fallback (rawPageText) that the scorer consumes when selectors miss.
+  const hasPageText = (currentProspect.rawPageText || '').trim().length > 200;
+  const hasIdentity = currentProspect.type === 'company'
+    ? !!(currentProspect.companyName || currentProspect.industry || currentProspect.size || hasPageText)
+    : !!(currentProspect.name || currentProspect.headline || currentProspect.currentTitle || hasPageText);
+  if (!hasIdentity) {
+    return toast('Couldn’t read this page yet — scroll to the top or reload, then Score again.', true);
+  }
+  const dq = computeDataConfidence(currentProspect);
+  if (dq.score < 25) {
+    toast('Low page data — this will be a rough estimate. Open the About / Experience sections for a better read.');
+  }
+
+  isScoring = true;
   showState('loading');
   el.cacheBadge.hidden = true;
   el.icpUsedBadge.hidden = true;
@@ -580,7 +670,7 @@ async function handleScore() {
     console.error('[popup] scoring error', err);
 
     if (err.code === 'ALL_MODELS_EXHAUSTED') {
-      showError('All 3 models are rate-limited for today.\nClick "Reset Rate Limit Cache" if it\'s a new day.');
+      showError(err.message);
     } else if (err.code === 'INVALID_KEY' || err.code === 'NO_API_KEY') {
       showError(err.message);
     } else {
@@ -589,6 +679,7 @@ async function handleScore() {
     showState('error');
   }
 
+  isScoring = false;
   await refreshCascadeHealth();
 }
 
@@ -602,7 +693,9 @@ async function handleScore() {
  */
 async function renderListView(leads) {
   el.leadList.innerHTML = '';
-  el.listCount.textContent = `${leads.length} leads found`;
+  el.listCount.textContent = currentListData?.capped
+    ? `${leads.length} of ${currentListData.total} on this page`
+    : `${leads.length} leads found`;
   el.batchProgress.hidden = true;
 
   for (let i = 0; i < leads.length; i++) {
@@ -640,7 +733,21 @@ async function renderListView(leads) {
     row.addEventListener('click', () => handleScoreSingle(i));
 
     el.leadList.appendChild(row);
+
+    // Mark cached rows with score + confidence for sorting/low-confidence styling.
+    if (lead._score) {
+      row.dataset.score = String(lead._score.overallScore);
+      const q = lead._score.qualifiable;
+      const badge = row.querySelector('.lead-row__score');
+      if (q && badge) {
+        badge.dataset.conf = q.level;
+        badge.title = `Score confidence ${q.percent}% (${q.level})`;
+        row.classList.toggle('lead-row--lowconf', q.level === 'low');
+      }
+    }
   }
+
+  sortLeadRows();
 }
 
 /**
@@ -654,7 +761,7 @@ async function handleScoreSingle(index) {
   if (!leads || !leads[index]) return;
 
   const lead = leads[index];
-  const row = el.leadList.children[index];
+  const row = el.leadList.querySelector(`.lead-row[data-index="${index}"]`);
   if (!row) return;
 
   // Show spinner
@@ -692,6 +799,7 @@ async function handleScoreSingle(index) {
     toast(err.message || 'Scoring failed', true);
   }
 
+  sortLeadRows();
   await refreshCascadeHealth();
 }
 
@@ -732,7 +840,7 @@ async function handleScoreAll() {
     if (batchStopped) break;
 
     const lead = leads[idx];
-    const row  = el.leadList.children[idx];
+    const row  = el.leadList.querySelector(`.lead-row[data-index="${idx}"]`);
     if (!row) continue;
 
     // Show spinner
@@ -796,6 +904,7 @@ async function handleScoreAll() {
     toast('Batch stopped');
   }
 
+  sortLeadRows();
   await refreshCascadeHealth();
 }
 
@@ -813,7 +922,7 @@ function updateBatchProgress(done, total) {
 
 /** Update a lead row with the score result */
 function updateLeadRowScore(row, result) {
-  const { overallScore, tier } = result;
+  const { overallScore, tier, qualifiable } = result;
   const cls = `lead-row__score lead-row__score--${tier.toLowerCase()}`;
 
   const spinner = row.querySelector('.lead-row__spinner');
@@ -824,8 +933,27 @@ function updateLeadRowScore(row, result) {
     const badge = document.createElement('span');
     badge.className = cls;
     badge.textContent = overallScore;
+    if (qualifiable) {
+      badge.dataset.conf = qualifiable.level;
+      badge.title = `Score confidence ${qualifiable.percent}% (${qualifiable.level}) — list scores are card-only estimates; open the profile for a full read.`;
+    }
     target.replaceWith(badge);
   }
+
+  // Record score for sorting + flag low-confidence rows.
+  row.dataset.score = String(overallScore);
+  if (qualifiable) row.classList.toggle('lead-row--lowconf', qualifiable.level === 'low');
+}
+
+/** Reorder lead rows by score (desc); un-scored rows sink to the bottom. */
+function sortLeadRows() {
+  const rows = Array.from(el.leadList.querySelectorAll('.lead-row'));
+  rows.sort((a, b) => {
+    const sa = a.dataset.score !== undefined ? Number(a.dataset.score) : -1;
+    const sb = b.dataset.score !== undefined ? Number(b.dataset.score) : -1;
+    return sb - sa;
+  });
+  rows.forEach(r => el.leadList.appendChild(r));
 }
 
 /** Build a mini-profile object from list card data for scoring */
@@ -859,7 +987,8 @@ function escapeHtml(str) {
 
 function renderResult(result, icpProfile = null, icpReason = null) {
   const { overallScore, tier, breakdown, summary, approachSuggestion, modelUsed,
-          decisionMaker, keyInsights, redFlags, talkingPoints, experienceSummary } = result;
+          decisionMaker, keyInsights, redFlags, talkingPoints, experienceSummary,
+          qualifiable } = result;
 
   // ---- ICP Used badge ----
   if (icpProfile && el.icpUsedBadge) {
@@ -886,6 +1015,22 @@ function renderResult(result, icpProfile = null, icpReason = null) {
 
   // Tier label
   el.scoreTier.textContent = `${TIER_EMOJI[tier] || ''} ${tier}`;
+
+  // ---- Qualifiable % (score confidence) ----
+  if (qualifiable && typeof qualifiable.percent === 'number') {
+    el.qualifiable.hidden = false;
+    const statusLabels = { high: 'Well-evidenced', medium: 'Partly inferred', low: 'Mostly estimated' };
+    el.qualifiableValue.textContent  = `${qualifiable.percent}%`;
+    el.qualifiableStatus.textContent  = statusLabels[qualifiable.level] || '';
+    el.qualifiableStatus.dataset.level = qualifiable.level;
+    el.qualifiableFill.dataset.level   = qualifiable.level;
+    el.qualifiableNote.textContent     = qualifiable.note || '';
+    requestAnimationFrame(() => {
+      el.qualifiableFill.style.width = `${qualifiable.percent}%`;
+    });
+  } else {
+    el.qualifiable.hidden = true;
+  }
 
   // ---- Decision Maker badge ----
   if (decisionMaker) {
@@ -963,17 +1108,17 @@ function renderResult(result, icpProfile = null, icpReason = null) {
     el.expCurrentRole.textContent = experienceSummary.currentRole || '—';
 
     el.expCurrentCompany.innerHTML = experienceSummary.currentCompany
-      ? `<strong>Company:</strong> ${experienceSummary.currentCompany}`
+      ? `<strong>Company:</strong> ${escapeHtml(experienceSummary.currentCompany)}`
       : '';
 
     if (experienceSummary.previousNotableRoles?.length) {
-      el.expPreviousRoles.innerHTML = `<strong>Notable Roles:</strong> ${experienceSummary.previousNotableRoles.join(' → ')}`;
+      el.expPreviousRoles.innerHTML = `<strong>Notable Roles:</strong> ${escapeHtml(experienceSummary.previousNotableRoles.join(' → '))}`;
     } else {
       el.expPreviousRoles.textContent = '';
     }
 
     if (experienceSummary.industryExperience?.length) {
-      el.expIndustries.innerHTML = `<strong>Industries:</strong> ${experienceSummary.industryExperience.join(', ')}`;
+      el.expIndustries.innerHTML = `<strong>Industries:</strong> ${escapeHtml(experienceSummary.industryExperience.join(', '))}`;
     } else {
       el.expIndustries.textContent = '';
     }

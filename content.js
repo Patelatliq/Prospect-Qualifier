@@ -388,7 +388,7 @@
     // ---- Always grab visible body text for AI context ----
     // This is critical: when user is on Experience tab, all roles are
     // visible in the body text even if DOM selectors can't find them.
-    data.rawPageText = bodySnippet(5000);
+    data.rawPageText = bodySnippet(1500);
 
     return data;
   }
@@ -671,8 +671,6 @@
     ].join(', '));
 
     cards.forEach((card) => {
-      if (leads.length >= 25) return;
-
       // ---- Name ----
       const name = text([
         '[data-anonymize="person-name"]',
@@ -763,6 +761,15 @@
         data.url       = location.href;
         data.scrapedAt = Date.now();
 
+        // Selector self-check: no identity usually means LinkedIn changed its
+        // DOM, or the page hasn't finished loading. Cheap early warning.
+        const noIdentity = data.type === 'company'
+          ? !data.companyName
+          : !(data.name || data.headline || data.currentTitle);
+        if (noIdentity) {
+          console.warn('[LeadQualify] Scrape found no identity fields — LinkedIn DOM may have changed or the page is still loading:', location.href);
+        }
+
         reply({ success: true, data });
       } catch (err) {
         reply({ error: `Scrape failed: ${err.message}` });
@@ -778,12 +785,17 @@
           return true;
         }
 
-        const leads = scrapeSalesNavList();
+        const all    = scrapeSalesNavList();
+        const LIST_CAP = 25;
+        const capped = all.length > LIST_CAP;
+        const leads  = all.slice(0, LIST_CAP);
         reply({
           success: true,
           data: {
             type:    'list',
             leads,
+            total:   all.length,
+            capped,
             url:     location.href,
             scrapedAt: Date.now(),
           },

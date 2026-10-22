@@ -15,6 +15,9 @@ import {
   computeWeightedScore,
   deriveTier,
   parseResponse,
+  validateScoreResponse,
+  applyIcpScoring,
+  icpFingerprint,
   clamp,
   formatMoney,
 } from '../icp-scorer.js';
@@ -181,6 +184,66 @@ test('formatMoney: human-readable currency', () => {
   assert.equal(formatMoney(1_000_000_000), '$1B');
 });
 
+test('formatMoney: values that round up switch unit instead of "$1000K"', () => {
+  assert.equal(formatMoney(999_999), '$1M');
+  assert.equal(formatMoney(999_500), '$1M');
+  assert.equal(formatMoney(999_400), '$999K');
+  assert.equal(formatMoney(999_999_999), '$1B');
+  assert.equal(formatMoney(1_000_000), '$1M');
+});
+
+/* ------------------------------------------------------------------ */
+/*  validateScoreResponse                                             */
+/* ------------------------------------------------------------------ */
+
+const fullBreakdown = (n) => {
+  const cats = ['titleFit', 'companySize', 'industry', 'techSignals', 'aiFit', 'companyRevenue'];
+  const o = {};
+  cats.slice(0, n).forEach(k => { o[k] = { score: 60, confidence: 'HIGH' }; });
+  return JSON.stringify({ breakdown: o });
+};
+
+test('validateScoreResponse: accepts a full breakdown', () => {
+  assert.doesNotThrow(() => validateScoreResponse(fullBreakdown(6)));
+});
+
+test('validateScoreResponse: rejects a breakdown with too few scored categories', () => {
+  assert.throws(() => validateScoreResponse(fullBreakdown(2)), /categories scored/);
+});
+
+test('validateScoreResponse: rejects invalid JSON and missing breakdown', () => {
+  assert.throws(() => validateScoreResponse('{"breakdown":'));
+  assert.throws(() => validateScoreResponse('{"overallScore":90}'), /Missing breakdown/);
+});
+
+/* ------------------------------------------------------------------ */
+/*  applyIcpScoring + icpFingerprint (cache refresh after ICP edits)  */
+/* ------------------------------------------------------------------ */
+
+test('applyIcpScoring: re-derives score and tier from the CURRENT weights/thresholds', () => {
+  const result = { breakdown: bd({ titleFit: 100, companyRevenue: 40 }), overallScore: 1, tier: 'COLD' };
+  const titleHeavy = applyIcpScoring(result, { weights: { titleFit: 90, companyRevenue: 10 } });
+  const revHeavy   = applyIcpScoring(result, { weights: { titleFit: 10, companyRevenue: 90 } });
+  assert.equal(titleHeavy.overallScore, 94);
+  assert.equal(titleHeavy.tier, 'HOT');
+  assert.equal(revHeavy.overallScore, 46);
+  assert.equal(revHeavy.tier, 'COLD');
+  const lowBar = applyIcpScoring(result, { weights: { titleFit: 10, companyRevenue: 90 }, tierThresholds: { hot: 80, warm: 45 } });
+  assert.equal(lowBar.tier, 'WARM');
+  assert.equal(result.overallScore, 1, 'input is not mutated');
+});
+
+test('icpFingerprint: changes with prompt-shaping fields, not with weights/thresholds/order', () => {
+  const base = { revenueThreshold: 2_500_000, targetTitles: ['CEO', 'CTO'], targetIndustries: ['SaaS'],
+                 weights: { titleFit: 20 }, tierThresholds: { hot: 80, warm: 50 } };
+  const fp = icpFingerprint(base);
+  assert.equal(icpFingerprint({ ...base, weights: { titleFit: 90 }, tierThresholds: { hot: 70, warm: 40 } }), fp);
+  assert.equal(icpFingerprint({ ...base, targetTitles: ['CTO', 'ceo'] }), fp);
+  assert.notEqual(icpFingerprint({ ...base, revenueThreshold: 500_000 }), fp);
+  assert.notEqual(icpFingerprint({ ...base, targetIndustries: ['SaaS', 'FinTech'] }), fp);
+  assert.notEqual(icpFingerprint({ ...base, excludedIndustries: ['Government'] }), fp);
+});
+
 /* ------------------------------------------------------------------ */
 /*  computeWeightedScore — confidence weighting (low-data-aware)       */
 /* ------------------------------------------------------------------ */
@@ -192,14 +255,14 @@ const bdc = (m) => {
   return o;
 };
 
-test('confidence-weighting: strong title + all-else-unknown rises above the flat mean', () => {
-  // Only title is HIGH-confidence; unknowns (LOW) are down-weighted ×0.25.
-  // (95*20 + 48*20)/40 = 2860/40 = 71.5 -> 72   (vs. flat mean 57)
+test('confidence-weighting: one confident input cannot dominate unknowns', () => {
+  // Title HIGH keeps 95; LOW 48s shrink toward 50: 50 + (48-50)*0.25 = 49.5.
+  // (95*20 + 49.5*80)/100 = 58.6 -> 59   (v9 weight-shrinking gave 72)
   const b = bdc({
     titleFit: [95, 'HIGH'], companySize: [48, 'LOW'], industry: [48, 'LOW'],
     techSignals: [48, 'LOW'], aiFit: [48, 'LOW'], companyRevenue: [48, 'LOW'],
   });
-  assert.equal(computeWeightedScore(b, DEFAULT_WEIGHTS), 72);
+  assert.equal(computeWeightedScore(b, DEFAULT_WEIGHTS), 59);
 });
 
 test('confidence-weighting: same scores all-HIGH give the flat weighted mean', () => {
@@ -210,13 +273,35 @@ test('confidence-weighting: same scores all-HIGH give the flat weighted mean', (
   assert.equal(computeWeightedScore(b, DEFAULT_WEIGHTS), 57);
 });
 
-test('confidence-weighting: weak title + unknowns sinks (list-view spread)', () => {
-  // (35*20 + 48*20)/40 = 1660/40 = 41.5 -> 42
+test('confidence-weighting: weak title + unknowns still sinks below neutral', () => {
+  // (35*20 + 49.5*80)/100 = 46.6 -> 47
   const b = bdc({
     titleFit: [35, 'HIGH'], companySize: [48, 'LOW'], industry: [48, 'LOW'],
     techSignals: [48, 'LOW'], aiFit: [48, 'LOW'], companyRevenue: [48, 'LOW'],
   });
-  assert.equal(computeWeightedScore(b, DEFAULT_WEIGHTS), 42);
+  assert.equal(computeWeightedScore(b, DEFAULT_WEIGHTS), 47);
+});
+
+test('confidence-weighting: CEO at an unknown company is not WARM-by-title (regression)', () => {
+  // v9 scored this 69. Low-confidence guesses now sit near neutral, and every
+  // category keeps its full weight: 2000+750+731.25+731.25+500+1062.5 = 5775 -> 58
+  const b = bdc({
+    titleFit: [100, 'HIGH'], companySize: [50, 'LOW'], industry: [45, 'LOW'],
+    techSignals: [45, 'LOW'], aiFit: [50, 'LOW'], companyRevenue: [20, 'LOW'],
+  });
+  assert.equal(computeWeightedScore(b, DEFAULT_WEIGHTS), 58);
+});
+
+test('confidence-weighting: low-confidence guess cannot sink a score far either', () => {
+  // Revenue guessed at 0 with LOW confidence only drags to 37.5, not 0.
+  const b = bdc({ titleFit: [80, 'HIGH'], companyRevenue: [0, 'LOW'] });
+  const w = { titleFit: 50, companyRevenue: 50 };
+  assert.equal(computeWeightedScore(b, w), 59);   // (80 + 37.5)/2 = 58.75
+});
+
+test('confidence-weighting: MEDIUM keeps 60% of the distance from neutral', () => {
+  const b = bdc({ titleFit: [100, 'MEDIUM'] });
+  assert.equal(computeWeightedScore(b, { titleFit: 1 }), 80);   // 50 + 50*0.6
 });
 
 test('confidence-weighting: missing confidence = full weight (backcompat with plain mean)', () => {

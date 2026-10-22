@@ -12,143 +12,6 @@
 import { scoreWithCascade } from './groq-engine.js';
 
 /* ------------------------------------------------------------------ */
-/*  Industry synonym/alias map                                        */
-/* ------------------------------------------------------------------ */
-
-/**
- * Maps industry names → related terms the AI should treat as equivalent.
- * Keys are normalized (lowercase). When a user types "Legal Services"
- * in their ICP, the code auto-expands it so the AI also recognizes
- * "law firm", "attorney", "legal tech", etc.
- */
-const INDUSTRY_ALIASES = {
-  // Tech
-  'saas':              ['software-as-a-service', 'cloud software', 'subscription software', 'hosted platform', 'web application', 'software platform'],
-  'cloud':             ['cloud computing', 'cloud infrastructure', 'IaaS', 'PaaS', 'cloud services', 'AWS', 'Azure', 'GCP'],
-  'dev-tools':         ['developer tools', 'devops', 'developer platform', 'code tools', 'IDE', 'CI/CD', 'developer experience'],
-  'ai/ml':             ['artificial intelligence', 'machine learning', 'deep learning', 'data science', 'NLP', 'computer vision', 'generative AI', 'LLM'],
-  'cybersecurity':     ['security', 'infosec', 'information security', 'cyber defense', 'network security', 'identity management', 'zero trust'],
-
-  // Finance
-  'fintech':           ['financial technology', 'payments', 'banking tech', 'digital banking', 'neobank', 'lending platform', 'wealth management', 'financial services technology', 'regtech', 'blockchain', 'crypto', 'DeFi'],
-  'insurtech':         ['insurance technology', 'digital insurance', 'insurance platform', 'claims tech'],
-  'financial services': ['banking', 'investment', 'asset management', 'capital markets', 'hedge fund', 'private equity', 'venture capital', 'wealth management'],
-
-  // Health
-  'healthtech':        ['healthcare technology', 'digital health', 'health IT', 'medical devices', 'telemedicine', 'telehealth', 'health informatics', 'clinical tech', 'pharma tech', 'biotech'],
-  'biotech':           ['biotechnology', 'pharmaceutical', 'pharma', 'life sciences', 'genomics', 'drug development'],
-
-  // Commerce
-  'e-commerce':        ['online retail', 'digital commerce', 'marketplace', 'D2C', 'direct-to-consumer', 'retail technology', 'online store', 'shopify', 'e-tail'],
-  'retail':            ['retail technology', 'brick-and-mortar', 'omnichannel', 'point of sale', 'POS', 'consumer goods', 'CPG'],
-
-  // Professional Services
-  'consulting':        ['management consulting', 'strategy consulting', 'advisory', 'professional services', 'business consulting', 'IT consulting', 'digital consulting', 'transformation consulting'],
-  'legal services':    ['law', 'law firm', 'legal tech', 'legaltech', 'attorney', 'counsel', 'legal consulting', 'compliance', 'corporate law', 'IP law', 'litigation', 'legal practice', 'paralegal', 'legal advisory'],
-  'professional services': ['services firm', 'advisory firm', 'consulting firm', 'accounting firm', 'audit', 'tax services', 'staffing'],
-  'accounting':        ['CPA', 'audit', 'tax', 'bookkeeping', 'financial audit', 'accounting firm', 'chartered accountant'],
-
-  // Education
-  'edtech':            ['education technology', 'e-learning', 'online education', 'LMS', 'learning platform', 'courseware', 'online courses', 'ed-tech', 'learning management'],
-
-  // Marketing
-  'martech':           ['marketing technology', 'digital marketing', 'ad tech', 'advertising technology', 'marketing automation', 'CRM', 'email marketing', 'SEO', 'content marketing'],
-  'media':             ['digital media', 'publishing', 'content', 'entertainment', 'streaming', 'news media', 'advertising', 'broadcasting'],
-
-  // Real Estate
-  'real estate':       ['property', 'proptech', 'real estate technology', 'property management', 'commercial real estate', 'residential real estate', 'REIT'],
-  'real estate tech':  ['proptech', 'property technology', 'real estate platform', 'property management software'],
-
-  // Logistics & Supply Chain
-  'logistics':         ['supply chain', 'freight', 'shipping', 'warehousing', 'transportation', 'fleet management', 'last mile delivery', '3PL', 'fulfillment'],
-  'supply chain':      ['logistics', 'procurement', 'warehouse management', 'inventory management', 'distribution'],
-
-  // HR & Recruiting
-  'recruitment tech':  ['HR tech', 'hiring platform', 'talent acquisition', 'staffing technology', 'ATS', 'applicant tracking', 'job board', 'recruiting'],
-  'hr tech':           ['human resources technology', 'people management', 'HRIS', 'payroll', 'benefits platform', 'workforce management', 'employee engagement'],
-
-  // Industry Verticals
-  'manufacturing':     ['industrial', 'factory', 'production', 'industrial IoT', 'smart manufacturing', 'industry 4.0'],
-  'construction':      ['building', 'construction tech', 'contech', 'architecture', 'engineering', 'BIM', 'project management'],
-  'energy':            ['cleantech', 'renewable energy', 'oil & gas', 'solar', 'wind', 'energy tech', 'utilities', 'power'],
-  'agriculture':       ['agritech', 'farming', 'ag-tech', 'precision agriculture', 'food tech', 'agribusiness'],
-  'automotive':        ['auto tech', 'mobility', 'EV', 'electric vehicles', 'connected cars', 'autonomous driving'],
-  'telecom':           ['telecommunications', 'telco', 'wireless', 'broadband', 'network', 'communications'],
-  'hospitality':       ['hotel', 'travel tech', 'tourism', 'restaurant tech', 'food service', 'travel'],
-  'gaming':            ['game development', 'game studio', 'esports', 'interactive entertainment', 'game tech'],
-  'non-profit':        ['NGO', 'charity', 'social enterprise', 'foundation', 'philanthropy'],
-  'government':        ['public sector', 'gov tech', 'federal', 'municipal', 'state agency', 'defense'],
-  'academia':          ['university', 'college', 'research institution', 'higher education', 'academic research'],
-
-  // Dropdown-format name aliases (match names from INDUSTRY_CATALOG in popup.js)
-  'cloud computing':   ['cloud', 'cloud infrastructure', 'IaaS', 'PaaS', 'cloud services', 'AWS', 'Azure', 'GCP'],
-  'ai / machine learning': ['artificial intelligence', 'machine learning', 'deep learning', 'data science', 'NLP', 'generative AI', 'LLM'],
-  'data analytics':    ['business intelligence', 'BI', 'data engineering', 'analytics platform', 'data warehouse'],
-  'software development': ['software engineering', 'app development', 'custom software', 'software agency'],
-  'it services':       ['managed services', 'IT outsourcing', 'IT support', 'systems integration', 'IT infrastructure'],
-  'banking':           ['commercial banking', 'retail banking', 'digital banking', 'neobank', 'banking technology'],
-  'insurance':         ['insurance company', 'insurance broker', 'underwriting', 'claims', 'reinsurance'],
-  'payments':          ['payment processing', 'payment gateway', 'digital payments', 'mobile payments', 'point of sale'],
-  'telemedicine':      ['telehealth', 'virtual care', 'remote patient monitoring', 'digital clinic'],
-  'pharmaceutical':    ['pharma', 'drug development', 'drug manufacturing', 'clinical trials'],
-  'medical devices':   ['medtech', 'medical equipment', 'medical instruments', 'diagnostic devices'],
-  'digital health':    ['health tech', 'health app', 'wellness tech', 'patient engagement'],
-  'd2c (direct to consumer)': ['D2C', 'direct to consumer', 'DTC brand', 'online brand'],
-  'marketplace':       ['online marketplace', 'two-sided marketplace', 'platform marketplace', 'peer-to-peer'],
-  'legal tech':        ['legal technology', 'law tech', 'legal automation', 'contract management', 'legal AI'],
-  'law firm':          ['law practice', 'legal practice', 'attorney firm', 'legal office', 'counsel'],
-  'management consulting': ['strategy consulting', 'business advisory', 'corporate consulting'],
-  'staffing & recruiting': ['recruitment', 'talent acquisition', 'headhunting', 'temp staffing', 'RPO'],
-  'proptech':          ['property technology', 'real estate technology', 'real estate platform'],
-  'commercial real estate': ['CRE', 'office space', 'commercial property', 'industrial real estate'],
-  'e-learning':        ['online learning', 'virtual classroom', 'distance learning', 'MOOC'],
-  'digital marketing': ['online marketing', 'growth marketing', 'performance marketing', 'SEM', 'SEO'],
-  'ad tech':           ['advertising technology', 'programmatic', 'ad exchange', 'DSP', 'SSP'],
-  'media & entertainment': ['media company', 'entertainment', 'content platform', 'digital media'],
-  'industrial iot':    ['IIoT', 'industry 4.0', 'smart factory', 'connected manufacturing'],
-  'freight & shipping': ['freight', 'shipping', 'cargo', 'ocean freight', 'air freight', 'trucking'],
-  'fleet management':  ['vehicle management', 'telematics', 'fleet tracking', 'fleet optimization'],
-  'renewable energy':  ['solar energy', 'wind energy', 'green energy', 'sustainable energy'],
-  'ev & electric vehicles': ['electric vehicles', 'EV', 'EV charging', 'electric mobility'],
-  'restaurants':       ['restaurant chain', 'food service', 'dining', 'restaurant tech', 'QSR', 'fast food'],
-  'food & beverage':   ['F&B', 'food industry', 'beverage industry', 'food manufacturing', 'food brand'],
-  'food tech':         ['food technology', 'food delivery', 'meal kit', 'food innovation', 'alt protein'],
-  'hotels & hospitality': ['hotel', 'hotel chain', 'hospitality', 'resort', 'hotel management', 'hotel tech'],
-  'travel & tourism':  ['travel', 'tourism', 'travel tech', 'online travel', 'booking platform', 'travel agency'],
-  'agritech':          ['agriculture technology', 'farming tech', 'precision farming', 'smart agriculture'],
-  'hr tech':           ['human resources technology', 'HRIS', 'payroll', 'people management', 'workforce management'],
-  'sports tech':       ['sports technology', 'sports analytics', 'athlete management', 'fan engagement'],
-  'fitness tech':      ['fitness technology', 'workout app', 'health & fitness', 'gym tech', 'wearables'],
-};
-
-/**
- * Takes a list of industry names from the user's ICP and expands each
- * into a rich string with synonyms, so the AI can semantically match.
- *
- * Example:
- *   Input:  ['SaaS', 'Legal Services']
- *   Output: 'SaaS (also: software-as-a-service, cloud software, subscription software, ...),
- *            Legal Services (also: law, law firm, legal tech, attorney, counsel, ...)'
- *
- * Industries without a known alias map are passed through as-is.
- *
- * @param  {string[]} industries  Array of industry names
- * @return {string}               Expanded comma-separated string
- */
-function expandIndustryList(industries) {
-  if (!industries?.length) return '';
-
-  return industries.map(ind => {
-    const key = ind.toLowerCase().trim();
-    const aliases = INDUSTRY_ALIASES[key];
-    if (aliases?.length) {
-      return `${ind} (also: ${aliases.join(', ')})`;
-    }
-    return ind;
-  }).join(', ');
-}
-
-/* ------------------------------------------------------------------ */
 /*  Dynamic system prompt builder                                     */
 /* ------------------------------------------------------------------ */
 
@@ -168,7 +31,7 @@ function buildSystemPrompt(icp, nonce) {
 
   const revThreshold = icp?.revenueThreshold || 2_500_000;
   const revFormatted = formatMoney(revThreshold);
-  const revHalf      = formatMoney(revThreshold / 2.5);
+  const revLow       = formatMoney(revThreshold / 2.5);
   const revDouble    = formatMoney(revThreshold * 2);
   const revQuad      = formatMoney(revThreshold * 4);
 
@@ -204,7 +67,7 @@ SCORING (0-100 each, add confidence HIGH/MEDIUM/LOW per category):
 5. AI FIT (${w.aiFit}%): AI-relevant/benefits from AI=70-100; Industry disrupted by AI=50-69; Low AI relevance=0-49
 
 6. REVENUE (${w.companyRevenue}%) — MOST IMPORTANT:
-   >${revQuad}=90-100; ${revDouble}-${revQuad}=75-89; ${revFormatted}-${revDouble}=60-74; ${revHalf}-${revFormatted}=30-59; <${revHalf}/unknown=0-29. Threshold=${revFormatted}.
+   >${revQuad}=90-100; ${revDouble}-${revQuad}=75-89; ${revFormatted}-${revDouble}=60-74; ${revLow}-${revFormatted}=30-59; <${revLow}=0-29; no signal at all=40 with LOW confidence. Threshold=${revFormatted}.
 
 REVENUE ESTIMATION (use ALL signals, pick best estimate):
 - Employee count: SaaS/Tech=$150-300K/emp, Consulting/Services=$100-200K/emp, E-commerce=$200-500K/emp, Manufacturing=$200-400K/emp, Default=$150K/emp
@@ -236,9 +99,12 @@ Respond ONLY with JSON:
  * e.g. 2500000 → "$2.5M", 500000 → "$500K", 10000000 → "$10M"
  */
 export function formatMoney(n) {
-  if (n >= 1_000_000_000) return `$${(n / 1_000_000_000).toFixed(1).replace(/\.0$/, '')}B`;
-  if (n >= 1_000_000)     return `$${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
-  if (n >= 1_000)         return `$${(n / 1_000).toFixed(0)}K`;
+  // Compare the ROUNDED value against the next unit so 999,999 reads "$1M",
+  // not "$1000K".
+  const fmt = (v) => v.toFixed(1).replace(/\.0$/, '');
+  if (Number(fmt(n / 1_000_000)) >= 1_000) return `$${fmt(n / 1_000_000_000)}B`;
+  if (Math.round(n / 1_000) >= 1_000)      return `$${fmt(n / 1_000_000)}M`;
+  if (n >= 1_000)                          return `$${(n / 1_000).toFixed(0)}K`;
   return `$${n}`;
 }
 
@@ -273,7 +139,9 @@ const INJECTION_PATTERNS = [
  *   1. NFKC-normalize + strip zero-width chars (closes cheap obfuscation),
  *   2. remove any [DATA…]/[/DATA…] fence tokens so content can't close the
  *      fence early and smuggle text outside the untrusted region,
- *   3. redact lines that look like injected instructions.
+ *   3. redact sentences that look like injected instructions (not whole
+ *      lines — the About section arrives as one line, and one bad sentence
+ *      shouldn't erase the rest of it).
  */
 export function neutralizeInjection(text) {
   if (!text) return text;
@@ -281,11 +149,15 @@ export function neutralizeInjection(text) {
   try { s = s.normalize('NFKC'); } catch (_) { /* older engines */ }
   s = s.replace(/[\u200B-\u200D\u2060\uFEFF]/g, '');            // strip zero-width chars
   s = s.replace(/\[\s*\/?\s*DATA(?:-[^\]\s]+)?\s*\]/gi, '[redacted-delimiter]'); // strip fence tokens
+  const isInjected = (t) => INJECTION_PATTERNS.some((re) => re.test(t.replace(/\s+/g, ' ')));
   return s
     .split(/\r?\n/)
     .map((line) => {
-      const probe = line.replace(/\s+/g, ' ');
-      return INJECTION_PATTERNS.some((re) => re.test(probe)) ? '[redacted: possible injected instruction]' : line;
+      if (!isInjected(line)) return line;
+      return line
+        .split(/(?<=[.!?;])\s+/)
+        .map((sentence) => (isInjected(sentence) ? '[redacted: possible injected instruction]' : sentence))
+        .join(' ');
     })
     .join('\n');
 }
@@ -399,6 +271,22 @@ export function parseResponse(raw) {
   return parsed;
 }
 
+/** Minimum categories a response must score before we accept it. */
+const MIN_SCORED_CATEGORIES = 4;
+
+/**
+ * parseResponse + a shape check, used as the cascade's `validate` hook so a
+ * malformed reply falls through to the next model instead of reaching the user.
+ */
+export function validateScoreResponse(raw) {
+  const parsed = parseResponse(raw);
+  const scored = SCORE_CATEGORIES.filter(k => typeof parsed.breakdown?.[k]?.score === 'number').length;
+  if (scored < MIN_SCORED_CATEGORIES) {
+    throw new Error(`only ${scored} of ${SCORE_CATEGORIES.length} categories scored`);
+  }
+  return parsed;
+}
+
 export function clamp(n) {
   return Math.max(0, Math.min(100, Math.round(n)));
 }
@@ -417,13 +305,14 @@ const SCORE_CATEGORIES = [
 ];
 
 /**
- * How much a category's ICP weight counts toward the OVERALL score, scaled by
- * the model's confidence in that category. LOW keeps a small residual weight
- * (0.25) rather than 0, so a known-bad signal still counts a little. Missing
- * confidence defaults to HIGH (full weight) — see computeWeightedScore.
+ * How far a category's score is trusted, by the model's confidence in it.
+ * A LOW-confidence score keeps only 25% of its distance from neutral (50), so
+ * a guess can neither inflate nor sink the overall score much. Missing
+ * confidence defaults to HIGH (score used as-is) — see computeWeightedScore.
  * (Distinct from EVIDENCE_FACTOR, which measures trust for the Qualifiable %.)
  */
 const SCORE_CONF_FACTOR = { HIGH: 1, MEDIUM: 0.6, LOW: 0.25 };
+const NEUTRAL_SCORE = 50;
 
 /**
  * Compute the overall score as the weighted average of the model's per-category
@@ -432,6 +321,11 @@ const SCORE_CONF_FACTOR = { HIGH: 1, MEDIUM: 0.6, LOW: 0.25 };
  *   - reproducible — same category scores + weights always yield the same total
  *   - auditable    — the total is provably a function of the visible bars
  *   - responsive   — the weight sliders actually move the result
+ *
+ * Every category keeps its full ICP weight; low confidence instead pulls the
+ * category's score toward neutral. (Shrinking the WEIGHT of unknowns, as v9
+ * did, let the one confident input — usually title — dominate: a CEO at an
+ * unknown company scored 69 instead of ~51.)
  *
  * Weights are normalized by their own sum, so custom profiles that don't total
  * 100 still produce a sensible 0-100 score.
@@ -450,16 +344,12 @@ export function computeWeightedScore(breakdown, weights) {
     if (icpWeight <= 0) continue;
     const cat = breakdown?.[key];
     // Missing category → neutral 50 (mirrors the prompt's missing-data posture).
-    const score = (cat && typeof cat.score === 'number') ? clamp(cat.score) : 50;
-    // Confidence-weight: a category the model was unsure about counts for less,
-    // so unknown/guessed inputs (common in low-data list view) can't drag a
-    // strong prospect toward the mean. Missing confidence = full weight, so
-    // plain weight math is unchanged when no confidence is supplied.
+    const score  = (cat && typeof cat.score === 'number') ? clamp(cat.score) : NEUTRAL_SCORE;
     const conf   = (cat?.confidence || 'HIGH').toUpperCase();
     const factor = SCORE_CONF_FACTOR[conf] ?? 1;
-    const effWeight = icpWeight * factor;
-    weightedSum += score * effWeight;
-    weightTotal += effWeight;
+    const effScore = NEUTRAL_SCORE + (score - NEUTRAL_SCORE) * factor;
+    weightedSum += effScore * icpWeight;
+    weightTotal += icpWeight;
   }
 
   if (weightTotal === 0) return 0;
@@ -582,6 +472,42 @@ export function enforceEvidenceHonesty(parsed, prospect) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  ICP-dependent derivations (also used to refresh cached scores)    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Fingerprint of the ICP fields that shape the PROMPT (and so the model's
+ * per-category scores). Weights and tier thresholds are left out on purpose:
+ * those only feed the arithmetic, which applyIcpScoring() can redo for free.
+ */
+export function icpFingerprint(icp) {
+  const list = (a) => (a || []).map(x => String(x).trim().toLowerCase()).sort().join('|');
+  return [
+    icp?.revenueThreshold || 2_500_000,
+    list(icp?.targetTitles),
+    list(icp?.targetIndustries),
+    list(icp?.adjacentIndustries),
+    list(icp?.excludedIndustries),
+  ].join('#');
+}
+
+/**
+ * (Re)derive overall score, tier and Qualifiable % from a result's breakdown
+ * using the given profile's weights and thresholds. Returns a new object.
+ */
+export function applyIcpScoring(result, icpProfile) {
+  const overallScore = computeWeightedScore(result.breakdown, icpProfile?.weights);
+  const qualifiable  = computeQualifiablePercent(result.breakdown, icpProfile?.weights);
+  qualifiable.note   = buildQualifiableNote(qualifiable);
+  return {
+    ...result,
+    overallScore,
+    tier: deriveTier(overallScore, icpProfile?.tierThresholds),
+    qualifiable,
+  };
+}
+
+/* ------------------------------------------------------------------ */
 /*  Public API                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -599,32 +525,26 @@ export async function scoreProspect(prospectData, icpProfile = null) {
     { role: 'user',   content: buildUserMessage(prospectData, nonce) },
   ];
 
-  const cascade = await scoreWithCascade(messages);
-  const score   = parseResponse(cascade.result);
+  const cascade = await scoreWithCascade(messages, { validate: validateScoreResponse });
+  const score   = cascade.parsed;
 
   // ---- Evidence honesty: downgrade guessed-revenue confidence BEFORE scoring ----
   enforceEvidenceHonesty(score, prospectData);
 
   // ---- Recompute the headline number deterministically ----
-  // Keep the model's per-category judgement, but derive the overall score and
-  // tier ourselves from the ICP weights/thresholds so the result is
-  // reproducible and auditable rather than the LLM's own (drifting) arithmetic.
+  // Keep the model's per-category judgement, but derive the overall score,
+  // tier and Qualifiable % ourselves from the ICP weights/thresholds so the
+  // result is reproducible and auditable rather than the LLM's own arithmetic.
   const modelSuggestedScore = typeof score.overallScore === 'number' ? score.overallScore : null;
-  score.overallScore = computeWeightedScore(score.breakdown, icpProfile?.weights);
-  score.tier         = deriveTier(score.overallScore, icpProfile?.tierThresholds);
-
-  // ---- Qualifiable %: how evidence-backed this verdict is ----
-  const qualifiable = computeQualifiablePercent(score.breakdown, icpProfile?.weights);
-  qualifiable.note  = buildQualifiableNote(qualifiable);
 
   return {
-    ...score,
-    qualifiable,                               // { percent, level, weakCategories, note }
+    ...applyIcpScoring(score, icpProfile),     // overallScore, tier, qualifiable {percent, level, weakCategories, note}
     modelSuggestedScore,                       // what the LLM guessed (for transparency/debugging)
     scoringMethod:   'weighted-deterministic',
     modelUsed:       cascade.modelUsed,
     cascadeAttempts: cascade.cascadeAttempts,
     icpProfileUsed:  icpProfile?.name || 'Default',
+    icpFingerprint:  icpFingerprint(icpProfile),
     timestamp:       Date.now(),
   };
 }

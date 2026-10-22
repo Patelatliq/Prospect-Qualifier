@@ -107,7 +107,7 @@ const INDUSTRY_CATALOG = [
   ]},
 ];
 
-import { scoreProspect }        from './icp-scorer.js';
+import { scoreProspect, applyIcpScoring, icpFingerprint } from './icp-scorer.js';
 import { CASCADE_MODELS }       from './groq-engine.js';
 import {
   getApiKey,
@@ -165,6 +165,7 @@ const el = {
   prospectName:     $('prospectName'),
   prospectHeadline: $('prospectHeadline'),
   prospectMeta:     $('prospectMeta'),
+  scrapeWarning:    $('scrapeWarning'),
 
   // Loading
   loadingText:    $('loadingText'),
@@ -263,6 +264,8 @@ const el = {
   icpName:            $('icpName'),
   icpRegions:         $('icpRegions'),
   icpRevenueThreshold:$('icpRevenueThreshold'),
+  icpTierHot:         $('icpTierHot'),
+  icpTierWarm:        $('icpTierWarm'),
   icpWeightTotal:     $('icpWeightTotal'),
   wTitleFit:          $('wTitleFit'),
   wCompanySize:       $('wCompanySize'),
@@ -286,6 +289,10 @@ const el = {
   indSearchExcluded: $('indSearchExcluded'),
   indPillsExcluded:  $('indPillsExcluded'),
   indListExcluded:   $('indListExcluded'),
+  indSelectAdjacent: $('indSelectAdjacent'),
+  indSearchAdjacent: $('indSearchAdjacent'),
+  indPillsAdjacent:  $('indPillsAdjacent'),
+  indListAdjacent:   $('indListAdjacent'),
   icpSave:            $('icpSave'),
   icpNew:             $('icpNew'),
   icpDelete:          $('icpDelete'),
@@ -300,6 +307,7 @@ const el = {
   leadList:         $('leadList'),
   btnScoreAll:      $('btnScoreAll'),
   btnStopBatch:     $('btnStopBatch'),
+  btnExportCsv:     $('btnExportCsv'),
 
   // Cascade
   dots:         [0, 1, 2].map((i) => $(`dot${i}`)),
@@ -327,7 +335,7 @@ let currentListData   = null;
 let batchStopped      = false;
 let isBatchRunning    = false;
 let isScoring         = false;   // a single-profile score is in flight
-let cachedResult      = null;
+const scoringRows     = new Set();  // list indices with a single-row score in flight
 let currentIcpProfile = null;   // resolved ICP for current prospect
 let icpProfiles       = [];     // all profiles from storage
 let editingProfileId  = null;   // which profile is being edited in settings
@@ -409,6 +417,7 @@ function bindEvents() {
   // List view buttons
   el.btnScoreAll.addEventListener('click', () => handleScoreAll());
   el.btnStopBatch.addEventListener('click', () => handleStopBatch());
+  el.btnExportCsv.addEventListener('click', () => handleExportCsv());
 
   // ICP settings toggle
   el.icpToggle.addEventListener('click', () => {
@@ -449,6 +458,7 @@ function bindEvents() {
     await resetIcpProfiles();
     await loadIcpSettings();
     toast('ICP profiles reset to defaults ✓');
+    scheduleRescan();
   });
 }
 
@@ -471,7 +481,17 @@ async function checkApiKey() {
 /*  Page check + scrape                                              */
 /* ================================================================= */
 
+/** Forget everything about the previous page so stale data can't be scored. */
+function resetPageState() {
+  currentProspect   = null;
+  currentListData   = null;
+  currentIcpProfile = null;
+  el.btnScore.disabled = true;
+  el.scrapeWarning.hidden = true;
+}
+
 async function checkCurrentPage() {
+  resetPageState();
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
@@ -494,7 +514,7 @@ async function checkCurrentPage() {
       try {
         await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          files: ['content.js'],
+          files: ['revenue-parser.js', 'content.js'],
         });
         await sleep(400);
         // Re-ping to get page type
@@ -528,18 +548,20 @@ async function checkCurrentPage() {
     if (response?.success && response.data) {
       currentProspect = response.data;
       renderProspect(currentProspect);
+      el.scrapeWarning.hidden = !currentProspect.scrapeWarnings?.includes('no-identity');
 
-      // Check score cache
-      const cached = await getCachedScore(currentProspect.url);
+      // Check score cache (refreshed against the CURRENT ICP profile)
+      const { profile, reason } = await resolveIcpProfile(currentProspect.location || '');
+      const cached = await getFreshCachedScore(currentProspect.url, profile);
+      el.btnScore.disabled = !hasApiKey;
       if (cached) {
-        cachedResult = cached;
-        renderResult(cached.result);
+        currentIcpProfile = profile;
+        renderResult(cached.result, profile, reason);
         renderDataConfidence(currentProspect);
         showCacheBadge(cached.timestamp);
         showState('result');
       } else {
         showState('prospect');
-        el.btnScore.disabled = !hasApiKey;
       }
     } else {
       showState('not-linkedin');
@@ -569,7 +591,7 @@ function scheduleRescan() {
     // If a score/batch is in flight, don't scan now — but DON'T drop the
     // navigation either; re-arm so it's honored once the flag clears (bounded,
     // self-clearing poll, since isScoring/isBatchRunning always reset).
-    if (isBatchRunning || isScoring) {
+    if (isBatchRunning || isScoring || scoringRows.size) {
       scheduleRescan();
       return;
     }
@@ -688,6 +710,22 @@ async function handleScore() {
 /* ================================================================= */
 
 /**
+ * Cached score for a URL, brought up to date with the given ICP profile.
+ *
+ * Weights and tier thresholds only feed the arithmetic, so a cached score is
+ * re-derived from its stored breakdown — slider changes apply instantly with
+ * no API call. Prompt-shaping fields (titles, industries, revenue threshold)
+ * change what the model was asked, so a mismatch there means re-score: null.
+ */
+async function getFreshCachedScore(url, profile) {
+  if (!url) return null;
+  const cached = await getCachedScore(url);
+  if (!cached) return null;
+  if (cached.result.icpFingerprint !== icpFingerprint(profile)) return null;
+  return { ...cached, result: applyIcpScoring(cached.result, profile) };
+}
+
+/**
  * Render the list of leads in the popup.
  * Pre-fills cached scores if available.
  */
@@ -707,7 +745,8 @@ async function renderListView(leads) {
     // Check cache for this lead
     let scoreHtml = '<span class="lead-row__score lead-row__score--empty">—</span>';
     if (lead.profileUrl) {
-      const cached = await getCachedScore(lead.profileUrl);
+      const { profile } = await resolveIcpProfile(lead.location || '');
+      const cached = await getFreshCachedScore(lead.profileUrl, profile);
       if (cached) {
         const s = cached.result.overallScore;
         const tier = cached.result.tier;
@@ -748,6 +787,7 @@ async function renderListView(leads) {
   }
 
   sortLeadRows();
+  updateExportButton();
 }
 
 /**
@@ -755,7 +795,7 @@ async function renderListView(leads) {
  */
 async function handleScoreSingle(index) {
   if (!hasApiKey) return toast('Set your API key first', true);
-  if (isBatchRunning) return;
+  if (isBatchRunning || scoringRows.has(index)) return;
 
   const leads = currentListData?.leads;
   if (!leads || !leads[index]) return;
@@ -764,10 +804,10 @@ async function handleScoreSingle(index) {
   const row = el.leadList.querySelector(`.lead-row[data-index="${index}"]`);
   if (!row) return;
 
+  scoringRows.add(index);
+
   // Show spinner
   row.classList.add('lead-row--scoring');
-  const scoreEl = row.querySelector('.lead-row__score, .lead-row__spinner')?.parentElement
-    || row;
   const existingScore = row.querySelector('.lead-row__score');
   if (existingScore) {
     existingScore.outerHTML = '<div class="lead-row__spinner"></div>';
@@ -799,7 +839,9 @@ async function handleScoreSingle(index) {
     toast(err.message || 'Scoring failed', true);
   }
 
+  scoringRows.delete(index);
   sortLeadRows();
+  updateExportButton();
   await refreshCascadeHealth();
 }
 
@@ -809,6 +851,7 @@ async function handleScoreSingle(index) {
 async function handleScoreAll() {
   if (!hasApiKey) return toast('Set your API key first', true);
   if (isBatchRunning) return;
+  if (scoringRows.size) return toast('Wait for the lead being scored to finish', true);
 
   const leads = currentListData?.leads;
   if (!leads?.length) return;
@@ -823,6 +866,7 @@ async function handleScoreAll() {
 
   const total = leads.length;
   let   done  = 0;
+  let   exhausted = false;
 
   // Count already-cached
   const uncachedIndices = [];
@@ -877,7 +921,8 @@ async function handleScoreAll() {
 
       // If all models exhausted, stop the batch
       if (err.code === 'ALL_MODELS_EXHAUSTED') {
-        toast('All models exhausted — batch stopped', true);
+        row.classList.remove('lead-row--scoring');
+        exhausted = true;
         break;
       }
     }
@@ -898,13 +943,16 @@ async function handleScoreAll() {
   el.btnStopBatch.hidden = true;
   updateBatchProgress(done, total);
 
-  if (!batchStopped) {
-    toast(`Batch complete — ${done}/${total} scored ✓`);
-  } else {
+  if (exhausted) {
+    toast('All models exhausted — batch stopped', true);
+  } else if (batchStopped) {
     toast('Batch stopped');
+  } else {
+    toast(`Batch complete — ${done}/${total} scored ✓`);
   }
 
   sortLeadRows();
+  updateExportButton();
   await refreshCascadeHealth();
 }
 
@@ -972,6 +1020,58 @@ function buildMiniProfile(lead) {
     rawPageText: [lead.name, lead.title, lead.company, lead.location, lead.snippet]
       .filter(Boolean).join(' | '),
   };
+}
+
+/* ================================================================= */
+/*  CSV export                                                       */
+/* ================================================================= */
+
+const CSV_COLUMNS = [
+  ['Name',             l => l.name],
+  ['Title',            l => l.title],
+  ['Company',          l => l.company],
+  ['Location',         l => l.location],
+  ['Score',            l => l._score?.overallScore],
+  ['Tier',             l => l._score?.tier],
+  ['Evidence-backed %',l => l._score?.qualifiable?.percent],
+  ['Est. revenue',     l => l._score?.breakdown?.companyRevenue?.estimatedRevenue],
+  ['Summary',          l => l._score?.summary],
+  ['ICP profile',      l => l._score?.icpProfileUsed],
+  ['Profile URL',      l => l.profileUrl],
+];
+
+/**
+ * Quote a CSV cell. Cells starting with = + - @ are prefixed with ' so a
+ * spreadsheet can't run scraped text as a formula (CSV injection).
+ */
+function csvCell(v) {
+  let s = v == null ? '' : String(v);
+  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
+function updateExportButton() {
+  el.btnExportCsv.disabled = !currentListData?.leads?.some(l => l._score);
+}
+
+function handleExportCsv() {
+  const scored = (currentListData?.leads || [])
+    .filter(l => l._score)
+    .sort((a, b) => b._score.overallScore - a._score.overallScore);
+  if (!scored.length) return toast('Score some leads first', true);
+
+  const lines = [
+    CSV_COLUMNS.map(([h]) => csvCell(h)).join(','),
+    ...scored.map(l => CSV_COLUMNS.map(([, get]) => csvCell(get(l))).join(',')),
+  ];
+  const blob = new Blob(['\uFEFF' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = `leadqualify-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast(`Exported ${scored.length} leads ✓`);
 }
 
 /** Escape HTML to prevent XSS in dynamic content */
@@ -1236,7 +1336,7 @@ function showState(name) {
   }
 
   // Update score button label based on cache state
-  if (name === 'result' && cachedResult) {
+  if (name === 'result') {
     el.btnScore.innerHTML = '<span class="btn__icon">🔄</span> Re-score';
   } else {
     el.btnScore.innerHTML = '<span class="btn__icon">🎯</span> Score Prospect';
@@ -1340,20 +1440,23 @@ function populateIcpEditor(profileId) {
   el.icpName.value = profile.name || '';
   el.icpRegions.value = (profile.regions || []).join(', ');
   el.icpRevenueThreshold.value = String(profile.revenueThreshold || 2500000);
+  el.icpTierHot.value  = profile.tierThresholds?.hot  ?? 80;
+  el.icpTierWarm.value = profile.tierThresholds?.warm ?? 50;
 
-  // Weight sliders
+  // Weight sliders (?? not ||, so a saved 0% weight isn't reset to its default)
   const w = profile.weights || {};
-  el.wTitleFit.value      = w.titleFit || 20;
-  el.wCompanySize.value   = w.companySize || 15;
-  el.wIndustry.value      = w.industry || 15;
-  el.wTechSignals.value   = w.techSignals || 15;
-  el.wAiFit.value         = w.aiFit || 10;
-  el.wCompanyRevenue.value = w.companyRevenue || 25;
+  el.wTitleFit.value      = w.titleFit ?? 20;
+  el.wCompanySize.value   = w.companySize ?? 15;
+  el.wIndustry.value      = w.industry ?? 15;
+  el.wTechSignals.value   = w.techSignals ?? 15;
+  el.wAiFit.value         = w.aiFit ?? 10;
+  el.wCompanyRevenue.value = w.companyRevenue ?? 25;
 
   // Target fields
   el.icpTargetTitles.value = (profile.targetTitles || []).join(', ');
   // Populate industry dropdowns
   targetIndustrySelect.setSelected(profile.targetIndustries || []);
+  adjacentIndustrySelect.setSelected(profile.adjacentIndustries || []);
   excludedIndustrySelect.setSelected(profile.excludedIndustries || []);
 
   updateWeightDisplay();
@@ -1404,15 +1507,12 @@ async function updateIcpActiveBadge() {
 async function handleIcpSave() {
   if (!editingProfileId) return;
 
-  const profile = icpProfiles.find(p => p.id === editingProfileId);
-  if (!profile) return;
+  const existing = icpProfiles.find(p => p.id === editingProfileId);
+  if (!existing) return;
 
-  // Read values from the form
-  profile.name = el.icpName.value.trim() || profile.name;
-  profile.regions = el.icpRegions.value.split(',').map(s => s.trim()).filter(Boolean);
-  profile.revenueThreshold = parseInt(el.icpRevenueThreshold.value) || 2500000;
-
-  profile.weights = {
+  // Build the updated profile as a copy and validate it BEFORE touching the
+  // in-memory list, so a rejected save leaves no half-applied edits behind.
+  const weights = {
     titleFit:       parseInt(el.wTitleFit.value) || 0,
     companySize:    parseInt(el.wCompanySize.value) || 0,
     industry:       parseInt(el.wIndustry.value) || 0,
@@ -1421,19 +1521,36 @@ async function handleIcpSave() {
     companyRevenue: parseInt(el.wCompanyRevenue.value) || 0,
   };
 
-  const total = Object.values(profile.weights).reduce((a, b) => a + b, 0);
+  const total = Object.values(weights).reduce((a, b) => a + b, 0);
   if (total !== 100) {
     toast(`Weights must total 100% (currently ${total}%)`, true);
     return;
   }
 
-  profile.targetTitles = el.icpTargetTitles.value.split(',').map(s => s.trim()).filter(Boolean);
-  profile.targetIndustries = targetIndustrySelect.getSelected();
-  profile.excludedIndustries = excludedIndustrySelect.getSelected();
+  const hot  = parseInt(el.icpTierHot.value);
+  const warm = parseInt(el.icpTierWarm.value);
+  if (!(hot >= 1 && hot <= 100 && warm >= 0 && warm < hot)) {
+    toast('Tier thresholds: HOT must be 1-100 and above WARM', true);
+    return;
+  }
+
+  const profile = {
+    ...existing,
+    name:               el.icpName.value.trim() || existing.name,
+    regions:            el.icpRegions.value.split(',').map(s => s.trim()).filter(Boolean),
+    revenueThreshold:   parseInt(el.icpRevenueThreshold.value) || 2500000,
+    tierThresholds:     { hot, warm },
+    weights,
+    targetTitles:       el.icpTargetTitles.value.split(',').map(s => s.trim()).filter(Boolean),
+    targetIndustries:   targetIndustrySelect.getSelected(),
+    adjacentIndustries: adjacentIndustrySelect.getSelected(),
+    excludedIndustries: excludedIndustrySelect.getSelected(),
+  };
 
   await saveIcpProfile(profile);
   await loadIcpSettings();
   toast(`${profile.name} saved ✓`);
+  scheduleRescan();   // refresh any cached score on screen with the new weights
 }
 
 /**
@@ -1748,6 +1865,14 @@ const targetIndustrySelect = new IndustrySelect({
   pillsWrap:   el.indPillsTarget,
   searchInput: el.indSearchTarget,
   listEl:      el.indListTarget,
+  variant:     'target',
+});
+
+const adjacentIndustrySelect = new IndustrySelect({
+  container:   el.indSelectAdjacent,
+  pillsWrap:   el.indPillsAdjacent,
+  searchInput: el.indSearchAdjacent,
+  listEl:      el.indListAdjacent,
   variant:     'target',
 });
 

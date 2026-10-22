@@ -1261,7 +1261,7 @@ a:hover { text-decoration: underline; }
 }
 
 .icp-section.open .icp-body {
-  max-height: 900px;
+  max-height: 1600px;   /* headroom for the full editor; content is ~1000px */
   margin-top: 12px;
   opacity: 1;
   overflow: visible;
@@ -1717,7 +1717,7 @@ a:hover { text-decoration: underline; }
   border: 1px solid var(--border);
   border-radius: var(--r-sm);
   min-height: 28px;
-  max-height: 68px;
+  max-height: 112px;   /* fits the 14 default adjacent industries + search */
   overflow-y: auto;
   cursor: text;
   transition: border-color 0.2s;
@@ -2024,5 +2024,43 @@ a:hover { text-decoration: underline; }
   opacity: 0.88;
 }
 .lead-row--lowconf .lead-row__name { opacity: 0.9; }
+
+/* ═══════════════ ICP TIER THRESHOLDS ═══════════════ */
+.icp-tiers {
+  display: flex;
+  gap: 8px;
+}
+.icp-tier {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+}
+.icp-tier__input {
+  width: 100%;
+  min-width: 0;
+  font-size: 0.8rem;
+}
+
+/* ═══════════════ SCRAPE WARNING ═══════════════ */
+.scrape-warning {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  font-size: 0.7rem;
+  line-height: 1.4;
+  color: var(--text-secondary);
+  background: rgba(255, 165, 2, 0.08);
+  border: 1px solid rgba(255, 165, 2, 0.25);
+  border-radius: var(--r-sm);
+}
+
+/* ═══════════════ CSV EXPORT ═══════════════ */
+.btn--export {
+  width: auto;
+  padding: 12px 14px;
+  margin: 0;
+}
 
 [hidden] { display: none !important; }

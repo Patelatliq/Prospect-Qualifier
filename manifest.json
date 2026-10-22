@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "LeadQualify — AI Prospect Scorer",
-  "version": "2.0.0",
-  "description": "Score LinkedIn prospects against your ICP using AI. 3-model Groq cascade for maximum free-tier throughput.",
+  "version": "2.1.0",
+  "description": "Score LinkedIn prospects against your ICP using AI. Deterministic weighted scoring over a 3-model Groq cascade.",
 
   "permissions": [
     "storage",
@@ -43,7 +43,7 @@
         "https://www.linkedin.com/sales/search/*",
         "https://www.linkedin.com/sales/lists/*"
       ],
-      "js": ["content.js"],
+      "js": ["revenue-parser.js", "content.js"],
       "run_at": "document_idle"
     }
   ],

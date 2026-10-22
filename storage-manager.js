@@ -16,11 +16,25 @@ const KEYS = {
   ICP_PROFILES:    'icp_profiles',
   ACTIVE_ICP_ID:   'active_icp_id',
   ICP_AUTO_SWITCH: 'icp_auto_switch',
+  TERMS_ACCEPTED:  'terms_accepted',
 };
 
 /** Return today's date string in UTC (YYYY-MM-DD) */
 function utcToday() {
   return new Date().toISOString().split('T')[0];
+}
+
+/**
+ * Serialize read-modify-write cycles on a storage key. chrome.storage has no
+ * transactions, so two overlapping cacheScore() calls (e.g. quick row clicks)
+ * would each read the old object and the second write would drop the first.
+ */
+const _locks = new Map();
+function withLock(key, fn) {
+  const prev = _locks.get(key) || Promise.resolve();
+  const next = prev.then(fn, fn);
+  _locks.set(key, next.catch(() => {}));
+  return next;
 }
 
 /* ------------------------------------------------------------------ */
@@ -41,6 +55,21 @@ export async function removeApiKey() {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Acceptable-use acknowledgement                                    */
+/* ------------------------------------------------------------------ */
+
+/** Whether the user has acknowledged the acceptable-use / data notice. */
+export async function getTermsAccepted() {
+  const result = await chrome.storage.local.get(KEYS.TERMS_ACCEPTED);
+  return result[KEYS.TERMS_ACCEPTED] === true;
+}
+
+/** Record the user's acknowledgement of the acceptable-use / data notice. */
+export async function setTermsAccepted(accepted) {
+  await chrome.storage.local.set({ [KEYS.TERMS_ACCEPTED]: !!accepted });
+}
+
+/* ------------------------------------------------------------------ */
 /*  Rate-limit flags                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -54,37 +83,63 @@ async function _setLimits(limits) {
 }
 
 /**
- * Mark a model as exhausted for today.
- * @param {string} modelId   e.g. "meta-llama/llama-4-scout-17b-16e-instruct"
- * @param {string} reason    "RPD" | "RPM" | "TPM"
+ * Mark a model as exhausted.
+ * - RPD/TPD (daily) limits expire at midnight UTC.
+ * - RPM/TPM (per-minute) limits expire after Groq's retry-after, or 60 seconds.
+ *
+ * @param {string} modelId         e.g. "openai/gpt-oss-120b"
+ * @param {string} reason          "RPD" | "RPM" | "TPM" | "TPD"
+ * @param {number} [retryAfterSec] Seconds from Groq's retry-after header
  */
-export async function setModelExhausted(modelId, reason = 'RPD') {
-  const limits = await _getLimits();
-  limits[modelId] = {
-    exhausted:     true,
-    exhaustedAt:   Date.now(),
-    exhaustedDate: utcToday(),
-    reason,
-  };
-  await _setLimits(limits);
+export async function setModelExhausted(modelId, reason = 'RPM', retryAfterSec = null) {
+  const isDaily = reason === 'RPD' || reason === 'TPD';
+  const retryMs = Number(retryAfterSec) > 0 ? Number(retryAfterSec) * 1000 : null;
+  const ttlMs   = isDaily ? null : (retryMs || 60 * 1000);
+
+  await withLock(KEYS.RATE_LIMITS, async () => {
+    const limits = await _getLimits();
+    limits[modelId] = {
+      exhausted:     true,
+      exhaustedAt:   Date.now(),
+      exhaustedDate: utcToday(),
+      expiresAt:     ttlMs ? Date.now() + ttlMs : null,  // null = midnight
+      reason,
+    };
+    await _setLimits(limits);
+  });
+}
+
+/** True when a limit entry has lapsed (TTL passed, or a daily flag from a previous day). */
+function _isExpired(entry, today = utcToday()) {
+  if (entry.expiresAt) return Date.now() > entry.expiresAt;
+  return entry.exhaustedDate !== today;
 }
 
 /**
- * Check whether a model is currently marked as exhausted.
- * Automatically clears stale flags from previous UTC days.
+ * Return the active rate-limit entry for a model ({ reason, expiresAt, ... }),
+ * or null if it isn't limited. Expired flags are pruned.
  */
-export async function isModelExhausted(modelId) {
+export async function getModelLimit(modelId) {
   const limits = await _getLimits();
   const entry  = limits[modelId];
-  if (!entry?.exhausted) return false;
+  if (!entry?.exhausted) return null;
 
-  // Auto-reset if the flag is from a previous day
-  if (entry.exhaustedDate !== utcToday()) {
-    delete limits[modelId];
-    await _setLimits(limits);
-    return false;
+  if (_isExpired(entry)) {
+    await withLock(KEYS.RATE_LIMITS, async () => {
+      const fresh = await _getLimits();
+      if (fresh[modelId] && _isExpired(fresh[modelId])) {
+        delete fresh[modelId];
+        await _setLimits(fresh);
+      }
+    });
+    return null;
   }
-  return true;
+  return entry;
+}
+
+/** Check whether a model is currently marked as exhausted. */
+export async function isModelExhausted(modelId) {
+  return (await getModelLimit(modelId)) !== null;
 }
 
 /**
@@ -92,7 +147,7 @@ export async function isModelExhausted(modelId) {
  * Wired to the "Reset Rate Limit Cache" button.
  */
 export async function clearAllRateLimits() {
-  await _setLimits({});
+  await withLock(KEYS.RATE_LIMITS, () => _setLimits({}));
 }
 
 /**
@@ -100,35 +155,48 @@ export async function clearAllRateLimits() {
  * Only includes models flagged *today* (stale entries are pruned).
  */
 export async function getCascadeHealth() {
-  const limits = await _getLimits();
-  const today  = utcToday();
-  const health = {};
-  let   dirty  = false;
+  return withLock(KEYS.RATE_LIMITS, async () => {
+    const limits = await _getLimits();
+    const today  = utcToday();
+    const health = {};
+    let   dirty  = false;
 
-  for (const [id, entry] of Object.entries(limits)) {
-    if (entry.exhausted && entry.exhaustedDate === today) {
+    for (const [id, entry] of Object.entries(limits)) {
+      if (!entry.exhausted) continue;
+
+      // Mirror getModelLimit() so the health display and the skip decision
+      // agree: prune TTL-expired (RPM/TPM) and previous-day (RPD/TPD) entries.
+      if (_isExpired(entry, today)) {
+        delete limits[id];
+        dirty = true;
+        continue;
+      }
+
       health[id] = { exhausted: true, reason: entry.reason };
-    } else if (entry.exhausted) {
-      // Stale — clean up
-      delete limits[id];
-      dirty = true;
     }
-  }
 
-  if (dirty) await _setLimits(limits);
-  return health;
+    if (dirty) await _setLimits(limits);
+    return health;
+  });
 }
 
 /* ------------------------------------------------------------------ */
 /*  Score cache                                                       */
 /* ------------------------------------------------------------------ */
 
-/** Normalize a LinkedIn URL so the same profile always matches. */
-function normalizeUrl(url) {
+/**
+ * Normalize a LinkedIn URL so the same profile always matches.
+ * Sales Navigator lead/company URLs carry search context after the entity id
+ * (/sales/lead/ACwAAA…,NAME_SEARCH,x1y2), so the same lead reached from two
+ * searches would otherwise get two cache entries.
+ */
+export function normalizeUrl(url) {
   try {
     const u = new URL(url);
+    let path = u.pathname;
+    if (path.startsWith('/sales/')) path = path.replace(/,[^/]*/g, '');
     // Strip query, hash, trailing slashes
-    return (u.origin + u.pathname).replace(/\/+$/, '');
+    return (u.origin + path).replace(/\/+$/, '');
   } catch {
     return url;
   }
@@ -147,7 +215,10 @@ async function _setCache(cache) {
  * Scoring version — bump this whenever the scoring prompt or logic changes.
  * Old cached scores with a different version are automatically invalidated.
  */
-const SCORING_VERSION = 4;
+const SCORING_VERSION = 10;  // v10: low-confidence scores shrink toward neutral; unknown revenue = 40
+
+/** Cap on cached scores; oldest are evicted (LRU by timestamp) beyond this. */
+const MAX_CACHED_SCORES = 500;
 
 /**
  * Cache a score result for a URL.
@@ -155,14 +226,28 @@ const SCORING_VERSION = 4;
  * @param {Object} result  The full scoring result
  */
 export async function cacheScore(url, result) {
-  const cache = await _getCache();
-  const key = normalizeUrl(url);
-  cache[key] = {
-    result,
-    timestamp: Date.now(),
-    version: SCORING_VERSION,
-  };
-  await _setCache(cache);
+  await withLock(KEYS.SCORE_CACHE, async () => {
+    const cache = await _getCache();
+    const key = normalizeUrl(url);
+    cache[key] = {
+      result,
+      timestamp: Date.now(),
+      version: SCORING_VERSION,
+    };
+
+    // Evict oldest entries beyond the cap (LRU by timestamp) so the cache can't
+    // grow unbounded toward the chrome.storage.local quota.
+    const keys = Object.keys(cache);
+    if (keys.length > MAX_CACHED_SCORES) {
+      keys
+        .map(k => [k, cache[k]?.timestamp || 0])
+        .sort((a, b) => a[1] - b[1])
+        .slice(0, keys.length - MAX_CACHED_SCORES)
+        .forEach(([k]) => delete cache[k]);
+    }
+
+    await _setCache(cache);
+  });
 }
 
 /**
@@ -180,8 +265,13 @@ export async function getCachedScore(url) {
 
   // Invalidate stale cache from older scoring versions
   if (entry.version !== SCORING_VERSION) {
-    delete cache[key];
-    await _setCache(cache);
+    await withLock(KEYS.SCORE_CACHE, async () => {
+      const fresh = await _getCache();
+      if (fresh[key]?.version !== SCORING_VERSION) {
+        delete fresh[key];
+        await _setCache(fresh);
+      }
+    });
     return null;
   }
 
@@ -192,7 +282,7 @@ export async function getCachedScore(url) {
  * Clear all cached scores.
  */
 export async function clearScoreCache() {
-  await _setCache({});
+  await withLock(KEYS.SCORE_CACHE, () => _setCache({}));
 }
 
 /* ------------------------------------------------------------------ */
@@ -232,7 +322,7 @@ function getDefaultProfiles() {
       isDefault: false,
       regions:   ['United States', 'USA', 'US', 'Canada', 'North America',
                   'California', 'New York', 'Texas', 'Florida', 'Illinois',
-                  'Washington', 'Massachusetts', 'Colorado', 'Georgia', 'Toronto',
+                  'Washington', 'Massachusetts', 'Colorado', 'Toronto',
                   'Vancouver', 'Montreal', 'San Francisco', 'Los Angeles',
                   'Chicago', 'Boston', 'Seattle', 'Austin', 'Denver', 'Miami',
                   'Atlanta', 'Dallas', 'Houston', 'Phoenix', 'Philadelphia'],
@@ -422,6 +512,24 @@ export async function setIcpAutoSwitch(enabled) {
 }
 
 /**
+ * Whole-word match of a location against region keywords. A plain substring
+ * test made "US" match "Australia", "Russia", "Belgium" and "Cyprus".
+ *
+ * @param  {string}   location  e.g. "Atlanta, Georgia, United States"
+ * @param  {string[]} regions   Region keywords from an ICP profile
+ * @return {boolean}
+ */
+export function matchesRegion(location, regions) {
+  if (!location || !regions?.length) return false;
+  return regions.some((region) => {
+    const r = String(region).trim();
+    if (!r) return false;
+    const escaped = r.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'iu').test(location);
+  });
+}
+
+/**
  * Resolve which ICP profile to use for a given prospect.
  *
  * If auto-switch is ON:
@@ -440,16 +548,10 @@ export async function resolveIcpProfile(location = '') {
   const autoSwitch = await getIcpAutoSwitch();
 
   if (autoSwitch && location) {
-    const locLower = location.toLowerCase();
-
     for (const profile of profiles) {
       if (!profile.regions?.length) continue; // skip profiles with no regions (default)
 
-      const matched = profile.regions.some(region =>
-        locLower.includes(region.toLowerCase())
-      );
-
-      if (matched) {
+      if (matchesRegion(location, profile.regions)) {
         return { profile, reason: 'auto', matchedRegion: location };
       }
     }

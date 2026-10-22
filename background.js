@@ -10,7 +10,7 @@
 /* ---- Install / Update ---- */
 chrome.runtime.onInstalled.addListener((details) => {
   if (details.reason === 'install') {
-    console.log('[LeadQualify] Extension installed — v2.0.0');
+    console.log('[LeadQualify] Extension installed — v' + chrome.runtime.getManifest().version);
   } else if (details.reason === 'update') {
     console.log('[LeadQualify] Extension updated to', chrome.runtime.getManifest().version);
   }

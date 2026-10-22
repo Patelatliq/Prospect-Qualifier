@@ -107,7 +107,7 @@ const INDUSTRY_CATALOG = [
   ]},
 ];
 
-import { scoreProspect }        from './icp-scorer.js';
+import { scoreProspect, applyIcpScoring, icpFingerprint } from './icp-scorer.js';
 import { CASCADE_MODELS }       from './groq-engine.js';
 import {
   getApiKey,
@@ -126,6 +126,8 @@ import {
   getIcpAutoSwitch,
   setIcpAutoSwitch,
   resolveIcpProfile,
+  getTermsAccepted,
+  setTermsAccepted,
 } from './storage-manager.js';
 
 /* ================================================================= */
@@ -134,7 +136,7 @@ import {
 
 const CIRCUMFERENCE = 2 * Math.PI * 54;   // score-ring radius = 54
 const TIER_EMOJI    = { HOT: '🔥', WARM: '🌡️', COLD: '❄️' };
-const BATCH_DELAY   = 3000; // 3 seconds between batch scores
+const BATCH_DELAY   = 3000; // 3 seconds between batch scores (safe with reduced token usage)
 
 /* ================================================================= */
 /*  DOM refs (cached once)                                           */
@@ -163,6 +165,7 @@ const el = {
   prospectName:     $('prospectName'),
   prospectHeadline: $('prospectHeadline'),
   prospectMeta:     $('prospectMeta'),
+  scrapeWarning:    $('scrapeWarning'),
 
   // Loading
   loadingText:    $('loadingText'),
@@ -218,6 +221,17 @@ const el = {
   cacheBadge:     $('cacheBadge'),
   cacheBadgeText: $('cacheBadgeText'),
 
+  // Qualifiable % (score confidence)
+  qualifiable:       $('qualifiable'),
+  qualifiableValue:  $('qualifiableValue'),
+  qualifiableStatus: $('qualifiableStatus'),
+  qualifiableFill:   $('qualifiableFill'),
+  qualifiableNote:   $('qualifiableNote'),
+
+  // Acceptable-use gate
+  consentGate:   $('consentGate'),
+  consentAccept: $('consentAccept'),
+
   // Data Confidence
   dataConfidence:       $('dataConfidence'),
   dataConfidenceValue:  $('dataConfidenceValue'),
@@ -250,6 +264,8 @@ const el = {
   icpName:            $('icpName'),
   icpRegions:         $('icpRegions'),
   icpRevenueThreshold:$('icpRevenueThreshold'),
+  icpTierHot:         $('icpTierHot'),
+  icpTierWarm:        $('icpTierWarm'),
   icpWeightTotal:     $('icpWeightTotal'),
   wTitleFit:          $('wTitleFit'),
   wCompanySize:       $('wCompanySize'),
@@ -273,6 +289,10 @@ const el = {
   indSearchExcluded: $('indSearchExcluded'),
   indPillsExcluded:  $('indPillsExcluded'),
   indListExcluded:   $('indListExcluded'),
+  indSelectAdjacent: $('indSelectAdjacent'),
+  indSearchAdjacent: $('indSearchAdjacent'),
+  indPillsAdjacent:  $('indPillsAdjacent'),
+  indListAdjacent:   $('indListAdjacent'),
   icpSave:            $('icpSave'),
   icpNew:             $('icpNew'),
   icpDelete:          $('icpDelete'),
@@ -287,6 +307,7 @@ const el = {
   leadList:         $('leadList'),
   btnScoreAll:      $('btnScoreAll'),
   btnStopBatch:     $('btnStopBatch'),
+  btnExportCsv:     $('btnExportCsv'),
 
   // Cascade
   dots:         [0, 1, 2].map((i) => $(`dot${i}`)),
@@ -313,7 +334,8 @@ let hasApiKey         = false;
 let currentListData   = null;
 let batchStopped      = false;
 let isBatchRunning    = false;
-let cachedResult      = null;
+let isScoring         = false;   // a single-profile score is in flight
+const scoringRows     = new Set();  // list indices with a single-row score in flight
 let currentIcpProfile = null;   // resolved ICP for current prospect
 let icpProfiles       = [];     // all profiles from storage
 let editingProfileId  = null;   // which profile is being edited in settings
@@ -323,13 +345,32 @@ let editingProfileId  = null;   // which profile is being edited in settings
 /* ================================================================= */
 
 document.addEventListener('DOMContentLoaded', async () => {
+  await checkConsent();
   await initializeIcpProfiles();
   await loadIcpSettings();
   bindEvents();
   await checkApiKey();
   await checkCurrentPage();
   await refreshCascadeHealth();
+  watchTabNavigation();
 });
+
+/**
+ * First-run acceptable-use gate. Shows the consent overlay until the user
+ * acknowledges it, then records the acknowledgement so it isn't shown again.
+ */
+async function checkConsent() {
+  const accepted = await getTermsAccepted();
+  if (accepted) {
+    el.consentGate.hidden = true;
+    return;
+  }
+  el.consentGate.hidden = false;
+  el.consentAccept.addEventListener('click', async () => {
+    await setTermsAccepted(true);
+    el.consentGate.hidden = true;
+  }, { once: true });
+}
 
 /* ================================================================= */
 /*  Event bindings                                                   */
@@ -376,6 +417,7 @@ function bindEvents() {
   // List view buttons
   el.btnScoreAll.addEventListener('click', () => handleScoreAll());
   el.btnStopBatch.addEventListener('click', () => handleStopBatch());
+  el.btnExportCsv.addEventListener('click', () => handleExportCsv());
 
   // ICP settings toggle
   el.icpToggle.addEventListener('click', () => {
@@ -416,6 +458,7 @@ function bindEvents() {
     await resetIcpProfiles();
     await loadIcpSettings();
     toast('ICP profiles reset to defaults ✓');
+    scheduleRescan();
   });
 }
 
@@ -438,7 +481,17 @@ async function checkApiKey() {
 /*  Page check + scrape                                              */
 /* ================================================================= */
 
+/** Forget everything about the previous page so stale data can't be scored. */
+function resetPageState() {
+  currentProspect   = null;
+  currentListData   = null;
+  currentIcpProfile = null;
+  el.btnScore.disabled = true;
+  el.scrapeWarning.hidden = true;
+}
+
 async function checkCurrentPage() {
+  resetPageState();
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
@@ -461,7 +514,7 @@ async function checkCurrentPage() {
       try {
         await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          files: ['content.js'],
+          files: ['revenue-parser.js', 'content.js'],
         });
         await sleep(400);
         // Re-ping to get page type
@@ -495,18 +548,20 @@ async function checkCurrentPage() {
     if (response?.success && response.data) {
       currentProspect = response.data;
       renderProspect(currentProspect);
+      el.scrapeWarning.hidden = !currentProspect.scrapeWarnings?.includes('no-identity');
 
-      // Check score cache
-      const cached = await getCachedScore(currentProspect.url);
+      // Check score cache (refreshed against the CURRENT ICP profile)
+      const { profile, reason } = await resolveIcpProfile(currentProspect.location || '');
+      const cached = await getFreshCachedScore(currentProspect.url, profile);
+      el.btnScore.disabled = !hasApiKey;
       if (cached) {
-        cachedResult = cached;
-        renderResult(cached.result);
+        currentIcpProfile = profile;
+        renderResult(cached.result, profile, reason);
         renderDataConfidence(currentProspect);
         showCacheBadge(cached.timestamp);
         showState('result');
       } else {
         showState('prospect');
-        el.btnScore.disabled = !hasApiKey;
       }
     } else {
       showState('not-linkedin');
@@ -515,6 +570,45 @@ async function checkCurrentPage() {
     console.warn('[popup] page check failed', err);
     showState('not-linkedin');
   }
+}
+
+/* ================================================================= */
+/*  SPA-navigation refresh                                           */
+/* ================================================================= */
+
+/**
+ * LinkedIn is a single-page app: navigating between profiles doesn't reload
+ * the tab, so the side panel would otherwise keep showing the previous
+ * prospect. Watch the active tab for URL changes (and tab switches) and
+ * re-scan — debounced, and skipped while a score/batch is running so we don't
+ * yank the view mid-scoring.
+ */
+let _rescanTimer = null;
+
+function scheduleRescan() {
+  clearTimeout(_rescanTimer);
+  _rescanTimer = setTimeout(async () => {
+    // If a score/batch is in flight, don't scan now — but DON'T drop the
+    // navigation either; re-arm so it's honored once the flag clears (bounded,
+    // self-clearing poll, since isScoring/isBatchRunning always reset).
+    if (isBatchRunning || isScoring || scoringRows.size) {
+      scheduleRescan();
+      return;
+    }
+    await checkCurrentPage();   // idempotent: re-reads the active tab
+    await refreshCascadeHealth();
+  }, 600);
+}
+
+function watchTabNavigation() {
+  // URL changes in the active tab (includes LinkedIn's history-API navigations,
+  // since we hold host permission for linkedin.com). No URL-equality dedupe —
+  // the 600ms debounce collapses event storms and checkCurrentPage is idempotent.
+  chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+    if (tab?.active && changeInfo.url) scheduleRescan();
+  });
+  // Switching to another tab (e.g. a different LinkedIn profile in another tab).
+  chrome.tabs.onActivated.addListener(() => scheduleRescan());
 }
 
 /* ================================================================= */
@@ -556,6 +650,24 @@ async function handleScore() {
   if (!currentProspect) return;
   if (!hasApiKey) return toast('Set your API key first', true);
 
+  // ---- Scrape-quality gate ----
+  // Don't score a page that hasn't loaded / has no identity, and warn (but
+  // allow) when page data is very thin — confidence-weighting handles the rest.
+  // Meaningful page text counts as identity: it's the scraper's deliberate
+  // fallback (rawPageText) that the scorer consumes when selectors miss.
+  const hasPageText = (currentProspect.rawPageText || '').trim().length > 200;
+  const hasIdentity = currentProspect.type === 'company'
+    ? !!(currentProspect.companyName || currentProspect.industry || currentProspect.size || hasPageText)
+    : !!(currentProspect.name || currentProspect.headline || currentProspect.currentTitle || hasPageText);
+  if (!hasIdentity) {
+    return toast('Couldn’t read this page yet — scroll to the top or reload, then Score again.', true);
+  }
+  const dq = computeDataConfidence(currentProspect);
+  if (dq.score < 25) {
+    toast('Low page data — this will be a rough estimate. Open the About / Experience sections for a better read.');
+  }
+
+  isScoring = true;
   showState('loading');
   el.cacheBadge.hidden = true;
   el.icpUsedBadge.hidden = true;
@@ -580,7 +692,7 @@ async function handleScore() {
     console.error('[popup] scoring error', err);
 
     if (err.code === 'ALL_MODELS_EXHAUSTED') {
-      showError('All 3 models are rate-limited for today.\nClick "Reset Rate Limit Cache" if it\'s a new day.');
+      showError(err.message);
     } else if (err.code === 'INVALID_KEY' || err.code === 'NO_API_KEY') {
       showError(err.message);
     } else {
@@ -589,6 +701,7 @@ async function handleScore() {
     showState('error');
   }
 
+  isScoring = false;
   await refreshCascadeHealth();
 }
 
@@ -597,12 +710,30 @@ async function handleScore() {
 /* ================================================================= */
 
 /**
+ * Cached score for a URL, brought up to date with the given ICP profile.
+ *
+ * Weights and tier thresholds only feed the arithmetic, so a cached score is
+ * re-derived from its stored breakdown — slider changes apply instantly with
+ * no API call. Prompt-shaping fields (titles, industries, revenue threshold)
+ * change what the model was asked, so a mismatch there means re-score: null.
+ */
+async function getFreshCachedScore(url, profile) {
+  if (!url) return null;
+  const cached = await getCachedScore(url);
+  if (!cached) return null;
+  if (cached.result.icpFingerprint !== icpFingerprint(profile)) return null;
+  return { ...cached, result: applyIcpScoring(cached.result, profile) };
+}
+
+/**
  * Render the list of leads in the popup.
  * Pre-fills cached scores if available.
  */
 async function renderListView(leads) {
   el.leadList.innerHTML = '';
-  el.listCount.textContent = `${leads.length} leads found`;
+  el.listCount.textContent = currentListData?.capped
+    ? `${leads.length} of ${currentListData.total} on this page`
+    : `${leads.length} leads found`;
   el.batchProgress.hidden = true;
 
   for (let i = 0; i < leads.length; i++) {
@@ -614,7 +745,8 @@ async function renderListView(leads) {
     // Check cache for this lead
     let scoreHtml = '<span class="lead-row__score lead-row__score--empty">—</span>';
     if (lead.profileUrl) {
-      const cached = await getCachedScore(lead.profileUrl);
+      const { profile } = await resolveIcpProfile(lead.location || '');
+      const cached = await getFreshCachedScore(lead.profileUrl, profile);
       if (cached) {
         const s = cached.result.overallScore;
         const tier = cached.result.tier;
@@ -640,7 +772,22 @@ async function renderListView(leads) {
     row.addEventListener('click', () => handleScoreSingle(i));
 
     el.leadList.appendChild(row);
+
+    // Mark cached rows with score + confidence for sorting/low-confidence styling.
+    if (lead._score) {
+      row.dataset.score = String(lead._score.overallScore);
+      const q = lead._score.qualifiable;
+      const badge = row.querySelector('.lead-row__score');
+      if (q && badge) {
+        badge.dataset.conf = q.level;
+        badge.title = `Score confidence ${q.percent}% (${q.level})`;
+        row.classList.toggle('lead-row--lowconf', q.level === 'low');
+      }
+    }
   }
+
+  sortLeadRows();
+  updateExportButton();
 }
 
 /**
@@ -648,19 +795,19 @@ async function renderListView(leads) {
  */
 async function handleScoreSingle(index) {
   if (!hasApiKey) return toast('Set your API key first', true);
-  if (isBatchRunning) return;
+  if (isBatchRunning || scoringRows.has(index)) return;
 
   const leads = currentListData?.leads;
   if (!leads || !leads[index]) return;
 
   const lead = leads[index];
-  const row = el.leadList.children[index];
+  const row = el.leadList.querySelector(`.lead-row[data-index="${index}"]`);
   if (!row) return;
+
+  scoringRows.add(index);
 
   // Show spinner
   row.classList.add('lead-row--scoring');
-  const scoreEl = row.querySelector('.lead-row__score, .lead-row__spinner')?.parentElement
-    || row;
   const existingScore = row.querySelector('.lead-row__score');
   if (existingScore) {
     existingScore.outerHTML = '<div class="lead-row__spinner"></div>';
@@ -692,6 +839,9 @@ async function handleScoreSingle(index) {
     toast(err.message || 'Scoring failed', true);
   }
 
+  scoringRows.delete(index);
+  sortLeadRows();
+  updateExportButton();
   await refreshCascadeHealth();
 }
 
@@ -701,6 +851,7 @@ async function handleScoreSingle(index) {
 async function handleScoreAll() {
   if (!hasApiKey) return toast('Set your API key first', true);
   if (isBatchRunning) return;
+  if (scoringRows.size) return toast('Wait for the lead being scored to finish', true);
 
   const leads = currentListData?.leads;
   if (!leads?.length) return;
@@ -715,6 +866,7 @@ async function handleScoreAll() {
 
   const total = leads.length;
   let   done  = 0;
+  let   exhausted = false;
 
   // Count already-cached
   const uncachedIndices = [];
@@ -732,7 +884,7 @@ async function handleScoreAll() {
     if (batchStopped) break;
 
     const lead = leads[idx];
-    const row  = el.leadList.children[idx];
+    const row  = el.leadList.querySelector(`.lead-row[data-index="${idx}"]`);
     if (!row) continue;
 
     // Show spinner
@@ -769,7 +921,8 @@ async function handleScoreAll() {
 
       // If all models exhausted, stop the batch
       if (err.code === 'ALL_MODELS_EXHAUSTED') {
-        toast('All models exhausted — batch stopped', true);
+        row.classList.remove('lead-row--scoring');
+        exhausted = true;
         break;
       }
     }
@@ -790,12 +943,16 @@ async function handleScoreAll() {
   el.btnStopBatch.hidden = true;
   updateBatchProgress(done, total);
 
-  if (!batchStopped) {
-    toast(`Batch complete — ${done}/${total} scored ✓`);
-  } else {
+  if (exhausted) {
+    toast('All models exhausted — batch stopped', true);
+  } else if (batchStopped) {
     toast('Batch stopped');
+  } else {
+    toast(`Batch complete — ${done}/${total} scored ✓`);
   }
 
+  sortLeadRows();
+  updateExportButton();
   await refreshCascadeHealth();
 }
 
@@ -813,7 +970,7 @@ function updateBatchProgress(done, total) {
 
 /** Update a lead row with the score result */
 function updateLeadRowScore(row, result) {
-  const { overallScore, tier } = result;
+  const { overallScore, tier, qualifiable } = result;
   const cls = `lead-row__score lead-row__score--${tier.toLowerCase()}`;
 
   const spinner = row.querySelector('.lead-row__spinner');
@@ -824,8 +981,27 @@ function updateLeadRowScore(row, result) {
     const badge = document.createElement('span');
     badge.className = cls;
     badge.textContent = overallScore;
+    if (qualifiable) {
+      badge.dataset.conf = qualifiable.level;
+      badge.title = `Score confidence ${qualifiable.percent}% (${qualifiable.level}) — list scores are card-only estimates; open the profile for a full read.`;
+    }
     target.replaceWith(badge);
   }
+
+  // Record score for sorting + flag low-confidence rows.
+  row.dataset.score = String(overallScore);
+  if (qualifiable) row.classList.toggle('lead-row--lowconf', qualifiable.level === 'low');
+}
+
+/** Reorder lead rows by score (desc); un-scored rows sink to the bottom. */
+function sortLeadRows() {
+  const rows = Array.from(el.leadList.querySelectorAll('.lead-row'));
+  rows.sort((a, b) => {
+    const sa = a.dataset.score !== undefined ? Number(a.dataset.score) : -1;
+    const sb = b.dataset.score !== undefined ? Number(b.dataset.score) : -1;
+    return sb - sa;
+  });
+  rows.forEach(r => el.leadList.appendChild(r));
 }
 
 /** Build a mini-profile object from list card data for scoring */
@@ -846,6 +1022,58 @@ function buildMiniProfile(lead) {
   };
 }
 
+/* ================================================================= */
+/*  CSV export                                                       */
+/* ================================================================= */
+
+const CSV_COLUMNS = [
+  ['Name',             l => l.name],
+  ['Title',            l => l.title],
+  ['Company',          l => l.company],
+  ['Location',         l => l.location],
+  ['Score',            l => l._score?.overallScore],
+  ['Tier',             l => l._score?.tier],
+  ['Evidence-backed %',l => l._score?.qualifiable?.percent],
+  ['Est. revenue',     l => l._score?.breakdown?.companyRevenue?.estimatedRevenue],
+  ['Summary',          l => l._score?.summary],
+  ['ICP profile',      l => l._score?.icpProfileUsed],
+  ['Profile URL',      l => l.profileUrl],
+];
+
+/**
+ * Quote a CSV cell. Cells starting with = + - @ are prefixed with ' so a
+ * spreadsheet can't run scraped text as a formula (CSV injection).
+ */
+function csvCell(v) {
+  let s = v == null ? '' : String(v);
+  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
+function updateExportButton() {
+  el.btnExportCsv.disabled = !currentListData?.leads?.some(l => l._score);
+}
+
+function handleExportCsv() {
+  const scored = (currentListData?.leads || [])
+    .filter(l => l._score)
+    .sort((a, b) => b._score.overallScore - a._score.overallScore);
+  if (!scored.length) return toast('Score some leads first', true);
+
+  const lines = [
+    CSV_COLUMNS.map(([h]) => csvCell(h)).join(','),
+    ...scored.map(l => CSV_COLUMNS.map(([, get]) => csvCell(get(l))).join(',')),
+  ];
+  const blob = new Blob(['\uFEFF' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = `leadqualify-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast(`Exported ${scored.length} leads ✓`);
+}
+
 /** Escape HTML to prevent XSS in dynamic content */
 function escapeHtml(str) {
   const div = document.createElement('div');
@@ -859,7 +1087,8 @@ function escapeHtml(str) {
 
 function renderResult(result, icpProfile = null, icpReason = null) {
   const { overallScore, tier, breakdown, summary, approachSuggestion, modelUsed,
-          decisionMaker, keyInsights, redFlags, talkingPoints, experienceSummary } = result;
+          decisionMaker, keyInsights, redFlags, talkingPoints, experienceSummary,
+          qualifiable } = result;
 
   // ---- ICP Used badge ----
   if (icpProfile && el.icpUsedBadge) {
@@ -886,6 +1115,22 @@ function renderResult(result, icpProfile = null, icpReason = null) {
 
   // Tier label
   el.scoreTier.textContent = `${TIER_EMOJI[tier] || ''} ${tier}`;
+
+  // ---- Qualifiable % (score confidence) ----
+  if (qualifiable && typeof qualifiable.percent === 'number') {
+    el.qualifiable.hidden = false;
+    const statusLabels = { high: 'Well-evidenced', medium: 'Partly inferred', low: 'Mostly estimated' };
+    el.qualifiableValue.textContent  = `${qualifiable.percent}%`;
+    el.qualifiableStatus.textContent  = statusLabels[qualifiable.level] || '';
+    el.qualifiableStatus.dataset.level = qualifiable.level;
+    el.qualifiableFill.dataset.level   = qualifiable.level;
+    el.qualifiableNote.textContent     = qualifiable.note || '';
+    requestAnimationFrame(() => {
+      el.qualifiableFill.style.width = `${qualifiable.percent}%`;
+    });
+  } else {
+    el.qualifiable.hidden = true;
+  }
 
   // ---- Decision Maker badge ----
   if (decisionMaker) {
@@ -963,17 +1208,17 @@ function renderResult(result, icpProfile = null, icpReason = null) {
     el.expCurrentRole.textContent = experienceSummary.currentRole || '—';
 
     el.expCurrentCompany.innerHTML = experienceSummary.currentCompany
-      ? `<strong>Company:</strong> ${experienceSummary.currentCompany}`
+      ? `<strong>Company:</strong> ${escapeHtml(experienceSummary.currentCompany)}`
       : '';
 
     if (experienceSummary.previousNotableRoles?.length) {
-      el.expPreviousRoles.innerHTML = `<strong>Notable Roles:</strong> ${experienceSummary.previousNotableRoles.join(' → ')}`;
+      el.expPreviousRoles.innerHTML = `<strong>Notable Roles:</strong> ${escapeHtml(experienceSummary.previousNotableRoles.join(' → '))}`;
     } else {
       el.expPreviousRoles.textContent = '';
     }
 
     if (experienceSummary.industryExperience?.length) {
-      el.expIndustries.innerHTML = `<strong>Industries:</strong> ${experienceSummary.industryExperience.join(', ')}`;
+      el.expIndustries.innerHTML = `<strong>Industries:</strong> ${escapeHtml(experienceSummary.industryExperience.join(', '))}`;
     } else {
       el.expIndustries.textContent = '';
     }
@@ -1091,7 +1336,7 @@ function showState(name) {
   }
 
   // Update score button label based on cache state
-  if (name === 'result' && cachedResult) {
+  if (name === 'result') {
     el.btnScore.innerHTML = '<span class="btn__icon">🔄</span> Re-score';
   } else {
     el.btnScore.innerHTML = '<span class="btn__icon">🎯</span> Score Prospect';
@@ -1195,20 +1440,23 @@ function populateIcpEditor(profileId) {
   el.icpName.value = profile.name || '';
   el.icpRegions.value = (profile.regions || []).join(', ');
   el.icpRevenueThreshold.value = String(profile.revenueThreshold || 2500000);
+  el.icpTierHot.value  = profile.tierThresholds?.hot  ?? 80;
+  el.icpTierWarm.value = profile.tierThresholds?.warm ?? 50;
 
-  // Weight sliders
+  // Weight sliders (?? not ||, so a saved 0% weight isn't reset to its default)
   const w = profile.weights || {};
-  el.wTitleFit.value      = w.titleFit || 20;
-  el.wCompanySize.value   = w.companySize || 15;
-  el.wIndustry.value      = w.industry || 15;
-  el.wTechSignals.value   = w.techSignals || 15;
-  el.wAiFit.value         = w.aiFit || 10;
-  el.wCompanyRevenue.value = w.companyRevenue || 25;
+  el.wTitleFit.value      = w.titleFit ?? 20;
+  el.wCompanySize.value   = w.companySize ?? 15;
+  el.wIndustry.value      = w.industry ?? 15;
+  el.wTechSignals.value   = w.techSignals ?? 15;
+  el.wAiFit.value         = w.aiFit ?? 10;
+  el.wCompanyRevenue.value = w.companyRevenue ?? 25;
 
   // Target fields
   el.icpTargetTitles.value = (profile.targetTitles || []).join(', ');
   // Populate industry dropdowns
   targetIndustrySelect.setSelected(profile.targetIndustries || []);
+  adjacentIndustrySelect.setSelected(profile.adjacentIndustries || []);
   excludedIndustrySelect.setSelected(profile.excludedIndustries || []);
 
   updateWeightDisplay();
@@ -1259,15 +1507,12 @@ async function updateIcpActiveBadge() {
 async function handleIcpSave() {
   if (!editingProfileId) return;
 
-  const profile = icpProfiles.find(p => p.id === editingProfileId);
-  if (!profile) return;
+  const existing = icpProfiles.find(p => p.id === editingProfileId);
+  if (!existing) return;
 
-  // Read values from the form
-  profile.name = el.icpName.value.trim() || profile.name;
-  profile.regions = el.icpRegions.value.split(',').map(s => s.trim()).filter(Boolean);
-  profile.revenueThreshold = parseInt(el.icpRevenueThreshold.value) || 2500000;
-
-  profile.weights = {
+  // Build the updated profile as a copy and validate it BEFORE touching the
+  // in-memory list, so a rejected save leaves no half-applied edits behind.
+  const weights = {
     titleFit:       parseInt(el.wTitleFit.value) || 0,
     companySize:    parseInt(el.wCompanySize.value) || 0,
     industry:       parseInt(el.wIndustry.value) || 0,
@@ -1276,19 +1521,36 @@ async function handleIcpSave() {
     companyRevenue: parseInt(el.wCompanyRevenue.value) || 0,
   };
 
-  const total = Object.values(profile.weights).reduce((a, b) => a + b, 0);
+  const total = Object.values(weights).reduce((a, b) => a + b, 0);
   if (total !== 100) {
     toast(`Weights must total 100% (currently ${total}%)`, true);
     return;
   }
 
-  profile.targetTitles = el.icpTargetTitles.value.split(',').map(s => s.trim()).filter(Boolean);
-  profile.targetIndustries = targetIndustrySelect.getSelected();
-  profile.excludedIndustries = excludedIndustrySelect.getSelected();
+  const hot  = parseInt(el.icpTierHot.value);
+  const warm = parseInt(el.icpTierWarm.value);
+  if (!(hot >= 1 && hot <= 100 && warm >= 0 && warm < hot)) {
+    toast('Tier thresholds: HOT must be 1-100 and above WARM', true);
+    return;
+  }
+
+  const profile = {
+    ...existing,
+    name:               el.icpName.value.trim() || existing.name,
+    regions:            el.icpRegions.value.split(',').map(s => s.trim()).filter(Boolean),
+    revenueThreshold:   parseInt(el.icpRevenueThreshold.value) || 2500000,
+    tierThresholds:     { hot, warm },
+    weights,
+    targetTitles:       el.icpTargetTitles.value.split(',').map(s => s.trim()).filter(Boolean),
+    targetIndustries:   targetIndustrySelect.getSelected(),
+    adjacentIndustries: adjacentIndustrySelect.getSelected(),
+    excludedIndustries: excludedIndustrySelect.getSelected(),
+  };
 
   await saveIcpProfile(profile);
   await loadIcpSettings();
   toast(`${profile.name} saved ✓`);
+  scheduleRescan();   // refresh any cached score on screen with the new weights
 }
 
 /**
@@ -1603,6 +1865,14 @@ const targetIndustrySelect = new IndustrySelect({
   pillsWrap:   el.indPillsTarget,
   searchInput: el.indSearchTarget,
   listEl:      el.indListTarget,
+  variant:     'target',
+});
+
+const adjacentIndustrySelect = new IndustrySelect({
+  container:   el.indSelectAdjacent,
+  pillsWrap:   el.indPillsAdjacent,
+  searchInput: el.indSearchAdjacent,
+  listEl:      el.indListAdjacent,
   variant:     'target',
 });
 

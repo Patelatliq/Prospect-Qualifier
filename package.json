@@ -1,0 +1,10 @@
+{
+  "name": "leadqualify",
+  "version": "2.1.0",
+  "description": "AI prospect scorer Chrome extension — dev tooling only (Chrome ignores this file).",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test \"test/**/*.test.js\""
+  }
+}

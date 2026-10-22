@@ -104,6 +104,15 @@
           </select>
         </div>
 
+        <!-- Tier thresholds -->
+        <div class="icp-row">
+          <label class="icp-label">Tier Thresholds <span class="icp-hint">(overall score at or above)</span></label>
+          <div class="icp-tiers">
+            <label class="icp-tier">🔥 HOT <input class="input icp-tier__input" id="icpTierHot" type="number" min="1" max="100" step="1" value="80"></label>
+            <label class="icp-tier">🌡️ WARM <input class="input icp-tier__input" id="icpTierWarm" type="number" min="0" max="99" step="1" value="50"></label>
+          </div>
+        </div>
+
         <!-- Weight sliders -->
         <div class="icp-weights">
           <label class="icp-label">Scoring Weights <span class="icp-weight-total" id="icpWeightTotal">100%</span></label>
@@ -159,6 +168,19 @@
           </div>
         </div>
 
+        <!-- Adjacent Industries (multi-select dropdown) -->
+        <div class="icp-row">
+          <label class="icp-label">Adjacent Industries <span class="icp-hint">(partial fit, scored 60-79)</span></label>
+          <div class="ind-select" id="indSelectAdjacent">
+            <div class="ind-select__pills" id="indPillsAdjacent">
+              <input class="ind-select__search" id="indSearchAdjacent" type="text" placeholder="Search industries...">
+            </div>
+            <div class="ind-select__dropdown" id="indDropdownAdjacent">
+              <div class="ind-select__list" id="indListAdjacent"></div>
+            </div>
+          </div>
+        </div>
+
         <!-- Excluded Industries (multi-select dropdown) -->
         <div class="icp-row">
           <label class="icp-label">Excluded Industries <span class="icp-hint">(click to select)</span></label>
@@ -204,6 +226,10 @@
           <p class="prospect-info__meta" id="prospectMeta"></p>
         </div>
       </div>
+      <p class="scrape-warning" id="scrapeWarning" hidden>
+        ⚠️ Couldn’t find this person’s name or title on the page. It may still be loading,
+        or LinkedIn changed its layout. Scroll to the top or reload, then try again.
+      </p>
     </section>
 
     <!-- ═══════════════ STATE: LOADING ═══════════════ -->
@@ -213,7 +239,7 @@
           <div class="loading__ring"></div>
           <div class="loading__ring loading__ring--delay"></div>
         </div>
-        <p class="loading__text" id="loadingText">Scoring with Llama 4 Scout ⚡</p>
+        <p class="loading__text" id="loadingText">Scoring…</p>
         <p class="loading__sub">Cascading through models…</p>
       </div>
     </section>
@@ -238,7 +264,7 @@
         <div class="data-confidence__header">
           <div class="data-confidence__score-wrap">
             <span class="data-confidence__icon">🔍</span>
-            <span class="data-confidence__label">Data Confidence:</span>
+            <span class="data-confidence__label" title="How much of the profile the extension could read from the page">Page data found:</span>
             <span class="data-confidence__value" id="dataConfidenceValue">0%</span>
             <span class="data-confidence__status" id="dataConfidenceStatus">—</span>
           </div>
@@ -312,6 +338,19 @@
             <span class="score-ring__label" id="scoreTier">—</span>
           </div>
         </div>
+      </div>
+
+      <!-- Qualifiable % — how evidence-backed the score is -->
+      <div class="qualifiable" id="qualifiable" hidden>
+        <div class="qualifiable__header">
+          <span class="qualifiable__label" title="How much of the score rests on evidence the model was confident about, rather than guesses">🛡️ Score backed by evidence</span>
+          <span class="qualifiable__value" id="qualifiableValue">0%</span>
+          <span class="qualifiable__status" id="qualifiableStatus">—</span>
+        </div>
+        <div class="qualifiable__bar">
+          <div class="qualifiable__fill" id="qualifiableFill"></div>
+        </div>
+        <p class="qualifiable__note" id="qualifiableNote"></p>
       </div>
 
       <!-- Decision Maker Badge -->
@@ -421,6 +460,7 @@
           <span class="list-header__count" id="listCount">0 leads found</span>
         </div>
       </div>
+      <p class="list-note">Card-only estimates, sorted by score. Open a profile and Score it for a full-confidence read.</p>
 
       <!-- Batch progress -->
       <div class="batch-progress" id="batchProgress" hidden>
@@ -441,6 +481,9 @@
         <button class="btn btn--stop" id="btnStopBatch" type="button" hidden>
           <span class="btn__icon">⏹️</span> Stop
         </button>
+        <button class="btn btn--ghost btn--export" id="btnExportCsv" type="button" title="Download scored leads as CSV" disabled>
+          <span class="btn__icon">⬇️</span> CSV
+        </button>
       </div>
     </section>
 
@@ -456,9 +499,9 @@
     <section class="cascade-bar" id="cascadeBar">
       <span class="cascade-bar__label">Cascade</span>
       <div class="cascade-bar__dots">
-        <span class="cascade-dot cascade-dot--ok" id="dot0" title="Llama 4 Scout">⚡</span>
-        <span class="cascade-dot cascade-dot--ok" id="dot1" title="Llama 3.3 70B">🧠</span>
-        <span class="cascade-dot cascade-dot--ok" id="dot2" title="Qwen 3 32B">🔮</span>
+        <span class="cascade-dot cascade-dot--ok" id="dot0" title="GPT-OSS 120B">⚡</span>
+        <span class="cascade-dot cascade-dot--ok" id="dot1" title="Qwen 3.6 27B">🧠</span>
+        <span class="cascade-dot cascade-dot--ok" id="dot2" title="GPT-OSS 20B">🔮</span>
       </div>
       <span class="cascade-bar__count" id="cascadeCount">3/3 healthy</span>
     </section>
@@ -476,6 +519,28 @@
     <!-- ═══════════════ TOAST ═══════════════ -->
     <div class="toast" id="toast" hidden>
       <p class="toast__msg" id="toastMsg"></p>
+    </div>
+
+    <!-- ═══════════════ ACCEPTABLE-USE GATE (first run) ═══════════════ -->
+    <div class="consent" id="consentGate" hidden>
+      <div class="consent__card">
+        <div class="consent__icon">🛡️</div>
+        <h2 class="consent__title">Before you start</h2>
+        <p class="consent__text">
+          LeadQualify analyzes the LinkedIn or Sales Navigator page <strong>you are
+          currently viewing</strong> and sends that content to your configured AI
+          provider (Groq) to score it against your ICP. It never browses, connects,
+          or messages on your behalf, and only runs on LinkedIn pages you open.
+        </p>
+        <ul class="consent__list">
+          <li>Automating or scraping LinkedIn may violate its User Agreement — <strong>you are responsible</strong> for how you use this tool.</li>
+          <li>Scraped page data is sent to Groq for scoring; scores are cached locally in your browser.</li>
+          <li>Use it for prospect research you're permitted to perform.</li>
+        </ul>
+        <button class="btn btn--primary consent__accept" id="consentAccept" type="button">
+          I understand — continue
+        </button>
+      </div>
     </div>
 
   </div>

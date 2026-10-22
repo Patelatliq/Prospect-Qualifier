@@ -1,5 +1,5 @@
 /**
- * content.js â€” LinkedIn + Sales Navigator Page Scraper
+ * content.js — LinkedIn + Sales Navigator Page Scraper
  *
  * Injected on:
  *   linkedin.com/in/*          (regular profiles)
@@ -26,7 +26,7 @@
         const el = ctx.querySelector(sel);
         const t = el?.textContent?.trim();
         if (t) return t;
-      } catch (_) { /* invalid selector â€“ skip */ }
+      } catch (_) { /* invalid selector – skip */ }
     }
     return '';
   }
@@ -75,90 +75,61 @@
    *   - Right-side account/company panel
    *   - Lead IQ tab details
    *   - Company page overview
-   * Falls back to regex-scanning ALL visible text for revenue patterns.
+   * Every candidate goes through revenue-parser.js, which only accepts a dollar
+   * amount sitting next to "revenue" used as a company metric — so job titles
+   * ("Chief Revenue Officer"), salaries and funding amounts are never taken
+   * as revenue. A wrong figure is worse than none: it is passed to the model
+   * as fact and lifts the revenue confidence cap.
    */
   function scrapeRevenue(ctx = document) {
-    // --- Method 1: Direct selectors for Sales Nav company info ---
-    const directRevenue = text([
-      // Sales Nav company info card / sidebar
+    const { extractRevenue, isRevenueLabel, isRevenueValue } = globalThis.LQRevenue || {};
+    if (!extractRevenue) return '';
+
+    /** A candidate element's text → a revenue figure, or ''. */
+    const fromText = (t) => {
+      const v = (t || '').trim();
+      if (!v) return '';
+      return isRevenueValue(v) ? v : extractRevenue(v);
+    };
+
+    // --- Method 1: Direct revenue fields (value-only, or label + value) ---
+    const directSelectors = [
       '[data-anonymize="revenue"]',
       '.company-info-card__revenue',
       '.company-revenue',
-      // Revenue-specific elements
-      '[class*="revenue"]',
-      // Sales Nav account/company detail sections
       '.account-info__revenue',
       '.company-info__revenue',
-      // Company overview card fields
-      'dd[class*="revenue"]',
-      'span[class*="revenue"]',
-      'div[class*="revenue"]',
-      // Sales Nav right panel / account panel
       '.account-detail__revenue',
       '.account-overview__revenue',
       '[data-test="revenue"]',
       '[data-test-id="revenue"]',
-    ], ctx);
-    if (directRevenue) return directRevenue;
-
-    // --- Method 2: Look for revenue in label/value pairs ---
-    // Sales Nav uses dt/dd, label/value, and table layouts
-    const labelSelectors = 'dt, .label, .info-label, th, .t-bold, .t-14.t-bold, span.t-bold';
-    const labelElements = ctx.querySelectorAll(labelSelectors);
-    for (const el of labelElements) {
-      const label = el.textContent?.trim().toLowerCase() || '';
-      if (label === 'revenue' || label === 'annual revenue' || label.includes('revenue')) {
-        // Try next sibling element
-        const dd = el.nextElementSibling;
-        const val = dd?.textContent?.trim();
-        if (val && val.length < 100) return val;
-        // Try parent's next sibling (for nested structures)
-        const parentNext = el.parentElement?.nextElementSibling;
-        const pVal = parentNext?.textContent?.trim();
-        if (pVal && pVal.length < 100) return pVal;
-      }
-    }
-
-    // --- Method 3: Walk all elements looking for "revenue" text near dollar amounts ---
-    // This catches cases where "revenue" and "$1M - $7.5M+" are in sibling/nearby elements
-    const allElements = ctx.querySelectorAll('li, div, span, p, td, dd');
-    for (const el of allElements) {
-      const elText = el.textContent?.trim() || '';
-      if (elText.length > 200) continue; // skip large containers
-
-      // Check if this element or its immediate text mentions revenue with a dollar amount
-      if (/revenue/i.test(elText) && /\$/.test(elText)) {
-        // Extract the dollar amount pattern
-        const dollarMatch = elText.match(
-          /\$[\d,.]+\s*[KMBT]?\+?(?:\s*[-–—~to]+\s*\$[\d,.]+\s*[KMBT]?\+?)?/
-        );
-        if (dollarMatch) return dollarMatch[0].trim();
-        // Return the full short text if it contains both revenue and $
-        if (elText.length < 80) return elText;
-      }
-    }
-
-    // --- Method 4: Scan full body text for revenue patterns ---
-    const bodyText = ctx.body?.innerText || ctx.innerText || '';
-    const revenuePatterns = [
-      // "$1M - $7.5M+ revenue" or "$1M - $7.5M revenue"
-      /\$[\d,.]+\s*[KMBT]?\+?\s*[-–—~to]+\s*\$[\d,.]+\s*[KMBT]?\+?\s*(?:revenue|rev\.)/i,
-      // "revenue: $X" or "annual revenue: $X - $Y"
-      /(?:annual\s+)?revenue[:\s]+\$[\d,.]+\s*[KMBT]?\+?(?:\s*[-–—~to]+\s*\$[\d,.]+\s*[KMBT]?\+?)?/i,
-      // "$XM+ revenue" or "$XB revenue"
-      /\$[\d,.]+\s*[KMBT]\+?\s*(?:revenue|rev\.)/i,
-      // "revenue" on one line, dollar range on next line (within 50 chars)
-      /revenue[\s\S]{0,30}\$[\d,.]+\s*[KMBT]?\+?(?:\s*[-–—~to]+\s*\$[\d,.]+\s*[KMBT]?\+?)?/i,
-      // Dollar range alone (last resort, captures "$1M - $7.5M+" anywhere)
-      /\$[\d,.]+\s*[KMBT]?\+?\s*[-–—~to]+\s*\$[\d,.]+\s*[KMBT]?\+?/i,
+      '[class*="revenue"]',
     ];
-
-    for (const pattern of revenuePatterns) {
-      const match = bodyText.match(pattern);
-      if (match) return match[0].trim();
+    for (const sel of directSelectors) {
+      try {
+        for (const el of ctx.querySelectorAll(sel)) {
+          const v = fromText(el.textContent);
+          if (v) return v;
+        }
+      } catch (_) { /* invalid selector – skip */ }
     }
 
-    // --- Method 5: Look in card-like containers that mention revenue ---
+    // --- Method 2: Label/value pairs (dt/dd, label/value, table layouts) ---
+    const labelSelectors = 'dt, .label, .info-label, th, .t-bold, .t-14.t-bold, span.t-bold';
+    for (const el of ctx.querySelectorAll(labelSelectors)) {
+      if (!isRevenueLabel(el.textContent)) continue;
+      const next       = el.nextElementSibling?.textContent;
+      const parentNext = el.parentElement?.nextElementSibling?.textContent;
+      if (isRevenueValue(next)) return next.trim();
+      if (isRevenueValue(parentNext)) return parentNext.trim();
+    }
+
+    // --- Method 3: Visible page text ("Revenue: $1M - $7.5M", "$5M revenue") ---
+    const bodyText = ctx.body?.innerText || ctx.innerText || '';
+    const fromBody = extractRevenue(bodyText);
+    if (fromBody) return fromBody;
+
+    // --- Method 4: Info cards via textContent (includes hidden hover cards) ---
     const infoCards = ctx.querySelectorAll([
       '.company-info-card',
       '[class*="company-info"]',
@@ -176,18 +147,8 @@
     ].join(', '));
 
     for (const card of infoCards) {
-      const cardText = card.textContent || '';
-      if (/revenue/i.test(cardText)) {
-        const dollarMatch = cardText.match(
-          /\$[\d,.]+\s*[KMBT]?\+?(?:\s*[-–—~to]+\s*\$[\d,.]+\s*[KMBT]?\+?)?/
-        );
-        if (dollarMatch) return dollarMatch[0].trim();
-        const revIdx = cardText.toLowerCase().indexOf('revenue');
-        if (revIdx >= 0) {
-          const snippet = cardText.substring(Math.max(0, revIdx - 30), revIdx + 60).trim();
-          if (snippet.length > 3 && snippet.length < 100) return snippet;
-        }
-      }
+      const v = extractRevenue(card.textContent);
+      if (v) return v;
     }
 
     return '';
@@ -237,7 +198,7 @@
     return data;
   }
 
-  /** Pull text from a named page section (#id â†’ closest <section>). */
+  /** Pull text from a named page section (#id → closest <section>). */
   function scrapeSection(id, selectors) {
     const anchor = document.querySelector(`#${id}`);
     if (!anchor) return '';
@@ -292,7 +253,7 @@
       'h1[class*="profile-topcard"]',
       'span[data-anonymize="person-name"]',
       '.profile-topcard h1',
-      // fallback â€” the first prominent heading on the page
+      // fallback — the first prominent heading on the page
       'h1',
     ]);
 
@@ -388,7 +349,7 @@
     // ---- Always grab visible body text for AI context ----
     // This is critical: when user is on Experience tab, all roles are
     // visible in the body text even if DOM selectors can't find them.
-    data.rawPageText = bodySnippet(5000);
+    data.rawPageText = bodySnippet(1500);
 
     return data;
   }
@@ -620,7 +581,7 @@
   function pageType() {
     const url = location.href;
 
-    // Sales Navigator paths (check first â€” more specific)
+    // Sales Navigator paths (check first — more specific)
     if (url.includes('/sales/search/'))  return 'sales-list';
     if (url.includes('/sales/lists/'))   return 'sales-list';
     if (url.includes('/sales/lead/'))    return 'sales-profile';
@@ -658,7 +619,7 @@
     const leads = [];
     const seen  = new Set();
 
-    // Sales Nav search result cards â€” multiple selector strategies
+    // Sales Nav search result cards — multiple selector strategies
     const cards = document.querySelectorAll([
       // Main search result items
       'li.artdeco-list__item',
@@ -671,8 +632,6 @@
     ].join(', '));
 
     cards.forEach((card) => {
-      if (leads.length >= 25) return;
-
       // ---- Name ----
       const name = text([
         '[data-anonymize="person-name"]',
@@ -763,6 +722,18 @@
         data.url       = location.href;
         data.scrapedAt = Date.now();
 
+        // Selector self-check: no identity usually means LinkedIn changed its
+        // DOM, or the page hasn't finished loading. Reported to the panel so
+        // the user sees it, not just the console.
+        const noIdentity = data.type === 'company'
+          ? !data.companyName
+          : !(data.name || data.headline || data.currentTitle);
+        data.scrapeWarnings = [];
+        if (noIdentity) {
+          data.scrapeWarnings.push('no-identity');
+          console.warn('[LeadQualify] Scrape found no identity fields — LinkedIn DOM may have changed or the page is still loading:', location.href);
+        }
+
         reply({ success: true, data });
       } catch (err) {
         reply({ error: `Scrape failed: ${err.message}` });
@@ -778,12 +749,17 @@
           return true;
         }
 
-        const leads = scrapeSalesNavList();
+        const all    = scrapeSalesNavList();
+        const LIST_CAP = 25;
+        const capped = all.length > LIST_CAP;
+        const leads  = all.slice(0, LIST_CAP);
         reply({
           success: true,
           data: {
             type:    'list',
             leads,
+            total:   all.length,
+            capped,
             url:     location.href,
             scrapedAt: Date.now(),
           },

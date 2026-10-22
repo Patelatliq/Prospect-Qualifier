@@ -63,7 +63,7 @@ Keeps the value (score any prospect in front of you against your ICP) while shed
 - [x] `[Accuracy]` **Qualifiable %** badge — `Σ(weight × evidenceFactor)/Σweight` + justification naming weak heavy inputs. [icp-scorer.js](icp-scorer.js)/[popup.js](popup.js)
 - [x] `[Accuracy]` **Two-number rule** — score always paired with confidence.
 - [x] `[Accuracy][Data]` **Revenue honesty** — `enforceEvidenceHonesty` caps guessed-revenue confidence + annotates "(estimated)".
-- [x] `[Accuracy]` **Confidence-weighted overall score** (low-data-aware) — categories the model is unsure about are down-weighted (HIGH ×1 / MED ×0.6 / LOW ×0.25), so list-view scores differentiate instead of collapsing to ~55. List rows sort by score, mark low-confidence, and show a card-only-estimate note.
+- [x] `[Accuracy]` **Confidence-weighted overall score** (low-data-aware) — low-confidence category scores are pulled toward neutral 50 (HIGH ×1 / MED ×0.6 / LOW ×0.25 of their distance from 50), with full weight kept. v9 shrank the *weight* instead, which let title alone carry list-view scores; fixed in v10. List rows sort by score, mark low-confidence, and show a card-only-estimate note.
 - [x] `[Harden][Accuracy]` **Truncation detection** — `finish_reason:'length'` → fail over. [groq-engine.js](groq-engine.js)
 - [ ] `[Accuracy]` **Label-free eval harness** — hand-rate ~25 prospects once → automated tier-agreement + rank-correlation on every prompt/model change (LLM-as-judge is an accepted no-ground-truth method 📎). `M`
 - [ ] `[Accuracy]` **Cross-model agreement signal** — lower confidence when two cascade models disagree sharply. `M`

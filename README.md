@@ -46,17 +46,20 @@ thresholds, and tier cut-offs, and are auto-selected from the prospect's locatio
 
 The **model scores each category individually**; the **extension computes the
 headline number itself** as a **confidence-weighted** average of those category
-scores (`computeWeightedScore` in [icp-scorer.js](icp-scorer.js)) — each
-category's ICP weight is scaled by how confident the model is in it (HIGH ×1,
-MEDIUM ×0.6, LOW ×0.25). Combined with `temperature: 0`, this makes the result:
+scores (`computeWeightedScore` in [icp-scorer.js](icp-scorer.js)). Every
+category keeps its full ICP weight; low confidence instead pulls that
+category's score toward neutral (50) — HIGH keeps the score as-is, MEDIUM keeps
+60% of its distance from 50, LOW keeps 25%. Combined with `temperature: 0`,
+this makes the result:
 
 - **Reproducible** — the same prospect + same ICP yields the same score.
 - **Auditable** — the total is a weighted function of the visible bars + their confidence.
 - **Responsive** — moving a weight slider actually moves the score.
 - **Low-data-aware** — categories the model is only guessing at (common in the
-  list/batch view, where just the search card is available) are down-weighted,
-  so a strong prospect isn't dragged to the mean by unknown revenue/size. Those
-  scores are marked low-confidence and paired with the Qualifiable %.
+  list/batch view, where just the search card is available) sit near neutral,
+  so a guess can neither inflate nor sink the score much, and the one confident
+  input (usually title) can't carry the whole score on its own. Those scores
+  are marked low-confidence and paired with the Qualifiable %.
 
 The model's own suggested total is still kept as `modelSuggestedScore` for
 debugging/transparency but is never shown as the score.
@@ -70,21 +73,28 @@ debugging/transparency but is never shown as the score.
   reliance on fragile markdown-fence stripping.
 - **3-model cascade** — if a model hits a rate limit (429) or errors, the engine
   falls through to the next. Each model ID has its own free-tier quota.
-  - Per-minute limits (RPM/TPM) disable a model for 60s; per-day limits
-    (RPD/TPD) until midnight UTC. If all three are briefly blocked, it waits
-    15s and retries (up to 2×).
+  - Per-minute limits (RPM/TPM) disable a model for Groq's `retry-after`
+    (default 60s); per-day limits (RPD/TPD) until midnight UTC. If every model
+    is blocked and a per-minute block lapses within 30s, it waits for it and
+    retries (up to 2×). Daily blocks are never cleared by the retry.
+  - Each request times out after 30s. Timeouts, truncated or empty replies,
+    and replies that fail the response-shape check fall through to the next
+    model instead of being retried on the same one.
 - **Model longevity** — the cascade uses `openai/gpt-oss-120b`,
   `qwen/qwen3.6-27b`, and `openai/gpt-oss-20b`. The previous Llama models
   (`llama-3.3-70b-versatile`, `llama-3.1-8b-instant`) are scheduled for Groq
   shutdown on **2026-08-16**; these are Groq's own recommended replacements.
 - **Score cache** is versioned (`SCORING_VERSION`); changing the scoring logic
-  auto-invalidates stale cached scores.
+  auto-invalidates stale cached scores. Cached scores are re-derived from their
+  stored breakdown with the *current* ICP weights and tier thresholds when
+  shown, so slider changes apply without an API call. Changing target titles,
+  industries or the revenue threshold marks the cached score stale (re-score).
 
 ---
 
 ## Data Confidence — read this before trusting a score
 
-Every result includes a **Data Confidence** meter (0–100%) showing how much of
+Every result includes a **Page data found** meter (0–100%) showing how much of
 the prospect's page data was actually captured (revenue, size, industry, title,
 experience, etc.). **The fit score is only as good as this number.**
 
@@ -150,19 +160,26 @@ experience, etc.). **The fit score is only as good as this number.**
 
 ## Testing
 
-The deterministic scoring layer is covered by a zero-dependency test suite
-(Node's built-in runner — no `npm install` needed):
+The extension's logic is covered by a zero-dependency test suite (Node's
+built-in runner — no `npm install` needed), run on every push by
+[GitHub Actions](.github/workflows/test.yml):
 
 ```bash
 npm test          # or: node --test "test/**/*.test.js"
 ```
 
-Tests live in [test/scoring.test.js](test/scoring.test.js) and cover the pure,
-reproducible logic: `computeWeightedScore` (weighting, normalization,
-missing-data defaults, clamping), `deriveTier` (threshold boundaries),
-`parseResponse` (fence/`<think>` stripping, clamping, validation), plus `clamp`
-and `formatMoney`. The Groq API call and DOM scraping are out of scope — they
-require a browser and network.
+| File | Covers |
+|------|--------|
+| [test/scoring.test.js](test/scoring.test.js) | Weighted score, tiers, response parsing and validation, re-scoring cached results against a changed ICP |
+| [test/qualifiable.test.js](test/qualifiable.test.js) | Qualifiable %, revenue honesty, prompt-injection defense |
+| [test/storage.test.js](test/storage.test.js) | Region auto-switch, URL normalization, score cache (incl. concurrent writes), rate-limit flags |
+| [test/groq-engine.test.js](test/groq-engine.test.js) | Cascade fall-through, timeouts, `retry-after`, wait-and-retry, daily limits (fake `fetch`) |
+| [test/revenue-parser.test.js](test/revenue-parser.test.js) | What the scraper accepts as a revenue figure |
+
+`chrome.storage` is replaced by an in-memory fake
+([test/helpers/chrome-mock.js](test/helpers/chrome-mock.js)). The DOM scrapers
+themselves still need a real LinkedIn page — verify them by loading the
+extension.
 
 ## Project layout
 
@@ -171,6 +188,7 @@ require a browser and network.
 | [manifest.json](manifest.json) | MV3 manifest, permissions, content-script matches |
 | [background.js](background.js) | Service worker: side panel + badge |
 | [content.js](content.js) | LinkedIn / Sales Navigator page scrapers |
+| [revenue-parser.js](revenue-parser.js) | Decides which page text counts as a revenue figure (loaded before content.js) |
 | [icp-scorer.js](icp-scorer.js) | Prompt builder, response parser, **deterministic scoring** |
 | [groq-engine.js](groq-engine.js) | 3-model Groq cascade, rate-limit handling, JSON mode |
 | [storage-manager.js](storage-manager.js) | API key, rate-limit flags, score cache, ICP profiles |

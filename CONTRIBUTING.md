@@ -40,10 +40,12 @@ A change that breaks any of these must not be merged.
 
 6. **Scores must stay reproducible and honest.** The overall score is computed
    deterministically as a **confidence-weighted** average of category scores ×
-   ICP weights (`computeWeightedScore`, factors HIGH ×1 / MEDIUM ×0.6 / LOW ×0.25)
-   at `temperature: 0` — the LLM's own total is never shown. Down-weighting
-   low-confidence categories is what keeps low-data (list-view) scores from
-   collapsing to the mean; don't revert it to a flat average. Inferred data must
+   ICP weights (`computeWeightedScore`) at `temperature: 0` — the LLM's own
+   total is never shown. Low confidence pulls a category's score toward neutral
+   50 (HIGH ×1 / MEDIUM ×0.6 / LOW ×0.25 of its distance from 50) while its
+   weight stays full. Don't go back to shrinking the *weight* of unsure
+   categories: that let one confident input (usually title) carry the whole
+   score (a CEO at an unknown company scored 69 instead of ~58). Inferred data must
    not present as fact: `enforceEvidenceHonesty` caps guessed-revenue confidence,
    and the Qualifiable % (`computeQualifiablePercent`) surfaces how
    evidence-backed a score is. Don't bypass these.
@@ -55,15 +57,19 @@ A change that breaks any of these must not be merged.
 
 ## Tests
 
-Pure logic (scoring, trust, safety) is covered by Node's built-in runner — no deps:
+Scoring, trust, storage, the Groq cascade and the revenue parser are covered by
+Node's built-in runner — no deps. CI runs the same command on every push:
 
 ```bash
 npm test
 ```
 
-Add tests in [test/](test/) for any new pure function. The LLM call and DOM
-scraping aren't unit-tested (they need a browser + network) — verify those by
-loading the extension and scoring a real profile.
+Add tests in [test/](test/) for any new pure function. Code that touches
+`chrome.storage` can use [test/helpers/chrome-mock.js](test/helpers/chrome-mock.js);
+the cascade tests stub `globalThis.fetch`. The DOM scrapers aren't unit-tested
+(they need a real LinkedIn page) — keep their text matching in a pure helper
+like [revenue-parser.js](revenue-parser.js), and verify the rest by loading the
+extension and scoring a real profile.
 
 > ⚠️ Block-comment gotcha: never put `**/*` inside a `/* … */` comment — the `*/`
 > closes the comment early. (Bit us once already.)

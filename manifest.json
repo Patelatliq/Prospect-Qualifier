@@ -43,7 +43,7 @@
         "https://www.linkedin.com/sales/search/*",
         "https://www.linkedin.com/sales/lists/*"
       ],
-      "js": ["content.js"],
+      "js": ["revenue-parser.js", "content.js"],
       "run_at": "document_idle"
     }
   ],

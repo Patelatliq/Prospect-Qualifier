@@ -15,10 +15,15 @@
  *   - max_completion_tokens 3500           → headroom for the full breakdown JSON + reasoning
  *
  * Rate-limit handling:
- *   - RPM/TPM (per-minute) → model disabled for 60 seconds
+ *   - RPM/TPM (per-minute) → model disabled for Groq's retry-after (default 60s)
  *   - RPD/TPD (per-day)    → model disabled until midnight UTC
  *   - Unknown 429          → treated as RPM (60s — safe default)
- *   - If ALL 3 models are temporarily blocked, auto-waits 15s and retries (up to 2×)
+ *   - If every model is blocked and at least one only per-minute, waits for the
+ *     soonest per-minute block to lapse (≤30s) and retries (up to 2×). Daily
+ *     blocks are never cleared by the retry.
+ *
+ * Each request times out after 30s, and a response that fails the caller's
+ * `validate` check falls through to the next model like any other failure.
  *
  * Model IDs verified against Groq's live catalog on 2026-07-23. The previous
  * cascade (llama-3.3-70b-versatile + llama-3.1-8b-instant) is scheduled for
@@ -28,9 +33,8 @@
 
 import {
   getApiKey,
-  isModelExhausted,
+  getModelLimit,
   setModelExhausted,
-  clearAllRateLimits,
 } from './storage-manager.js';
 
 /* ------------------------------------------------------------------ */
@@ -38,6 +42,10 @@ import {
 /* ------------------------------------------------------------------ */
 
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+
+const REQUEST_TIMEOUT_MS = 30_000;
+const MAX_RETRY_WAIT_MS  = 30_000;   // longest we'll wait for a per-minute block to lapse
+const PER_MINUTE_LIMITS  = new Set(['RPM', 'TPM']);
 
 export const CASCADE_MODELS = Object.freeze([
   {
@@ -72,11 +80,14 @@ export const CASCADE_MODELS = Object.freeze([
 /**
  * Run messages through the cascade.
  *
- * @param  {Array}  messages  OpenAI-style messages array
- * @return {Object}           { result, modelUsed, cascadeAttempts }
+ * @param  {Array}    messages            OpenAI-style messages array
+ * @param  {Object}   [opts]
+ * @param  {Function} [opts.validate]     (content) => parsed; throw to reject the
+ *                                        response and try the next model
+ * @return {Object}   { result, parsed, modelUsed, cascadeAttempts }
  * @throws {{ code, message, attempts }} when ALL models are exhausted
  */
-export async function scoreWithCascade(messages) {
+export async function scoreWithCascade(messages, { validate } = {}) {
   const apiKey = await getApiKey();
   if (!apiKey) {
     throw Object.assign(new Error('No API key configured.'), { code: 'NO_API_KEY' });
@@ -89,17 +100,25 @@ export async function scoreWithCascade(messages) {
 
     for (const model of CASCADE_MODELS) {
       /* ---------- skip if already rate-limited ---------- */
-      if (await isModelExhausted(model.id)) {
-        attempts.push({ model: model.name, status: 'SKIPPED', reason: 'exhausted' });
+      const limit = await getModelLimit(model.id);
+      if (limit) {
+        attempts.push({ model: model.name, status: 'SKIPPED', reason: limit.reason, expiresAt: limit.expiresAt });
         continue;
       }
 
       /* ---------- call Groq ---------- */
       try {
         const result = await _callWithRetry(model, messages, apiKey);
+        let parsed;
+        try {
+          parsed = validate ? validate(result) : undefined;
+        } catch (e) {
+          throw Object.assign(new Error(`Invalid response: ${e.message}`), { code: 'INVALID_RESPONSE' });
+        }
         return {
           success:         true,
           result,
+          parsed,
           modelUsed:       model,
           cascadeAttempts: attempts.length + 1,
         };
@@ -107,8 +126,9 @@ export async function scoreWithCascade(messages) {
         if (err.status === 429) {
           const limitType = _detectLimitType(err.message);
           console.warn(`[groq-engine] ${model.name} hit ${limitType} rate limit.`);
-          await setModelExhausted(model.id, limitType);
-          attempts.push({ model: model.name, status: 'RATE_LIMITED', reason: limitType });
+          await setModelExhausted(model.id, limitType, err.retryAfter);
+          const entry = await getModelLimit(model.id);
+          attempts.push({ model: model.name, status: 'RATE_LIMITED', reason: limitType, expiresAt: entry?.expiresAt });
           continue;
         }
 
@@ -127,31 +147,31 @@ export async function scoreWithCascade(messages) {
         if (err.code === 'INVALID_KEY') throw err;
 
         console.warn(`[groq-engine] Model ${model.id} error: ${err.message}`);
-        attempts.push({ model: model.name, status: 'ERROR', reason: err.message });
+        attempts.push({ model: model.name, status: err.code || 'ERROR', reason: err.message });
         continue;
       }
     }
 
-    /* ---------- all 3 failed — auto-retry if RPM-limited ---------- */
-    const hasTemporaryFailures = attempts.some(
-      a => a.reason === 'RPM' || a.reason === 'TPM' || a.reason === 'exhausted'
+    /* ---------- all failed — wait out a per-minute block if one is close ---------- */
+    const allLimited = attempts.every(a => a.status === 'SKIPPED' || a.status === 'RATE_LIMITED');
+    const soonest = Math.min(
+      ...attempts
+        .filter(a => PER_MINUTE_LIMITS.has(a.reason) && a.expiresAt)
+        .map(a => a.expiresAt),
     );
-    const allSkippedOrLimited = attempts.every(
-      a => a.status === 'SKIPPED' || a.status === 'RATE_LIMITED'
-    );
+    const waitMs = soonest - Date.now() + 250;
 
-    if (hasTemporaryFailures && allSkippedOrLimited && round < MAX_WAIT_ROUNDS) {
-      const waitMs = 15_000;
-      console.log(`[groq-engine] All models rate-limited. Auto-retrying in ${waitMs / 1000}s (round ${round + 2}/${MAX_WAIT_ROUNDS + 1})…`);
-      await new Promise(r => setTimeout(r, waitMs));
-      await clearAllRateLimits();
+    if (allLimited && Number.isFinite(soonest) && waitMs <= MAX_RETRY_WAIT_MS && round < MAX_WAIT_ROUNDS) {
+      const delay = Math.max(waitMs, 0);
+      console.log(`[groq-engine] All models rate-limited. Retrying in ${Math.ceil(delay / 1000)}s (round ${round + 2}/${MAX_WAIT_ROUNDS + 1})…`);
+      await new Promise(r => setTimeout(r, delay));
       continue;
     }
 
     /* ---------- permanent failure ---------- */
     const reasons = attempts.map(a => `${a.model}: ${a.status} (${a.reason})`).join(' ');
     const error = new Error(
-      `All 3 cascade models failed. ${reasons} Try "Reset Rate Limit Cache" or wait and retry.`,
+      `All ${CASCADE_MODELS.length} cascade models failed. ${reasons} Try "Reset Rate Limit Cache" or wait and retry.`,
     );
     error.code     = 'ALL_MODELS_EXHAUSTED';
     error.attempts = attempts;
@@ -187,7 +207,10 @@ async function _callWithRetry(model, messages, apiKey, maxRetries = 1) {
       return await _call(model, messages, apiKey);
     } catch (err) {
       lastError = err;
-      const isTransient = err.status >= 500 || err.message?.includes('fetch');
+      // Network blips and 5xx are worth one more try on the same model. A
+      // timeout, truncation or empty completion would just repeat at
+      // temperature 0, so those go straight to the next model.
+      const isTransient = !err.code && (err.status >= 500 || err.message?.includes('fetch'));
       if (!isTransient || attempt >= maxRetries) throw err;
       await new Promise(r => setTimeout(r, 2000));
       console.log(`[groq-engine] Retrying ${model.name} (attempt ${attempt + 2})…`);
@@ -197,6 +220,22 @@ async function _callWithRetry(model, messages, apiKey, maxRetries = 1) {
 }
 
 async function _call(model, messages, apiKey) {
+  // The timeout covers the whole exchange, including reading the body.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    return await _request(model, messages, apiKey, controller.signal);
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw Object.assign(new Error(`Timed out after ${REQUEST_TIMEOUT_MS / 1000}s.`), { code: 'TIMEOUT' });
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function _request(model, messages, apiKey, signal) {
   const body = {
     model:                 model.id,
     messages,
@@ -221,6 +260,7 @@ async function _call(model, messages, apiKey) {
       'Authorization': `Bearer ${apiKey}`,
     },
     body: JSON.stringify(body),
+    signal,
   });
 
   if (!res.ok) {
@@ -231,7 +271,7 @@ async function _call(model, messages, apiKey) {
     if (res.status === 429) {
       const err      = new Error(msg);
       err.status     = 429;
-      err.retryAfter = res.headers.get('retry-after');
+      err.retryAfter = parseFloat(res.headers.get('retry-after')) || null;
       throw err;
     }
 
@@ -253,21 +293,16 @@ async function _call(model, messages, apiKey) {
   // Strip Qwen <think> blocks and markdown fences
   content = content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
 
-  // Truncation → the JSON is almost certainly incomplete/invalid. Treat as a
-  // transient failure so the cascade falls through to the next model rather
-  // than surfacing a misleading JSON.parse error.
+  // Truncation → the JSON is almost certainly incomplete/invalid. Fall through
+  // to the next model rather than surfacing a misleading JSON.parse error.
   if (choice?.finish_reason === 'length') {
-    const err  = new Error('Response truncated (hit max_completion_tokens).');
-    err.status = 502;
-    throw err;
+    throw Object.assign(new Error('Response truncated (hit max_completion_tokens).'), { code: 'TRUNCATED' });
   }
 
-  // An empty completion (e.g. reasoning consumed the whole budget) is likewise
-  // transient — fall through to the next model.
+  // An empty completion (e.g. reasoning consumed the whole budget) likewise
+  // falls through to the next model.
   if (!content) {
-    const err  = new Error('Empty completion from model.');
-    err.status = 502;
-    throw err;
+    throw Object.assign(new Error('Empty completion from model.'), { code: 'EMPTY' });
   }
 
   return content;
